@@ -66,6 +66,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, Response
 from fastapi import Request
 import hmac
+from fastapi import Body
+
 
 
 API_VERSION = "TT-1.1.0"
@@ -277,14 +279,15 @@ def healthz():
 
 
 @core.post("/webhooks/telegram")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(
+    update: dict = Body(...),
+    request: Request = None
+):
     # Segurança opcional por header (recomendado)
     if TELEGRAM_WEBHOOK_SECRET:
-        received = request.headers.get("x-telegram-bot-api-secret-token", "").strip()
+        received = (request.headers.get("x-telegram-bot-api-secret-token") or "").strip()
         if not received or not hmac.compare_digest(received, TELEGRAM_WEBHOOK_SECRET):
             raise HTTPException(status_code=401, detail="Webhook secret inválido.")
-
-    update = await request.json()
 
     # Log básico
     conn = connect_once()
@@ -296,7 +299,7 @@ async def telegram_webhook(request: Request):
             "TELEGRAM",
             "WEBHOOK",
             "telegram_update",
-            json.dumps({"received": True}, ensure_ascii=False),
+            json.dumps({"update_id": update.get("update_id")}, ensure_ascii=False),
         ),
     )
     conn.commit()
@@ -1783,6 +1786,7 @@ if __name__ == "__main__":
 
 
 # In[ ]:
+
 
 
 
