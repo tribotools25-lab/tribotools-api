@@ -64,6 +64,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, Response
+from fastapi import Request
+import hmac
+
 
 API_VERSION = "TT-1.1.0"
 
@@ -73,6 +76,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = (BASE_DIR / "licenses.db").resolve()
 DB_PATH = os.getenv("LICENSE_DB", str(DEFAULT_DB))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+
 
 _conn: sqlite3.Connection | None = None
 _conn_lock = threading.Lock()
@@ -269,6 +274,30 @@ def healthz():
     cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = [r["name"] for r in cur.fetchall()]
     return {"ok": True, "tables": tables, "db_path": str(DB_PATH)}
+    @core.post("/webhooks/telegram")
+async def telegram_webhook(request: Request):
+    # Segurança opcional por header (recomendado)
+    if TELEGRAM_WEBHOOK_SECRET:
+        # Telegram permite usar secret token no webhook (vai como header)
+        # Header esperado: X-Telegram-Bot-Api-Secret-Token
+        received = request.headers.get("x-telegram-bot-api-secret-token", "").strip()
+        if not received or not hmac.compare_digest(received, TELEGRAM_WEBHOOK_SECRET):
+            raise HTTPException(status_code=401, detail="Webhook secret inválido.")
+
+    update = await request.json()
+
+    # Log básico (não explode o log com payload gigante)
+    conn = connect_once()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) VALUES (?,?,?,?,?)",
+        (now_utc_str(), "TELEGRAM", "WEBHOOK", "telegram_update", json.dumps({"ok": True}, ensure_ascii=False)),
+    )
+    conn.commit()
+
+    # Aqui por enquanto só confirmamos recebimento
+    return {"ok": True}
+
 
 
 # -------- LICENÇA: CLIENTE --------
@@ -1749,6 +1778,7 @@ if __name__ == "__main__":
 
 
 # In[ ]:
+
 
 
 
