@@ -274,28 +274,33 @@ def healthz():
     cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = [r["name"] for r in cur.fetchall()]
     return {"ok": True, "tables": tables, "db_path": str(DB_PATH)}
-    @core.post("/webhooks/telegram")
+
+
+@core.post("/webhooks/telegram")
 async def telegram_webhook(request: Request):
     # Segurança opcional por header (recomendado)
     if TELEGRAM_WEBHOOK_SECRET:
-        # Telegram permite usar secret token no webhook (vai como header)
-        # Header esperado: X-Telegram-Bot-Api-Secret-Token
         received = request.headers.get("x-telegram-bot-api-secret-token", "").strip()
         if not received or not hmac.compare_digest(received, TELEGRAM_WEBHOOK_SECRET):
             raise HTTPException(status_code=401, detail="Webhook secret inválido.")
 
     update = await request.json()
 
-    # Log básico (não explode o log com payload gigante)
+    # Log básico
     conn = connect_once()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) VALUES (?,?,?,?,?)",
-        (now_utc_str(), "TELEGRAM", "WEBHOOK", "telegram_update", json.dumps({"ok": True}, ensure_ascii=False)),
+        (
+            now_utc_str(),
+            "TELEGRAM",
+            "WEBHOOK",
+            "telegram_update",
+            json.dumps({"received": True}, ensure_ascii=False),
+        ),
     )
     conn.commit()
 
-    # Aqui por enquanto só confirmamos recebimento
     return {"ok": True}
 
 
@@ -1778,6 +1783,7 @@ if __name__ == "__main__":
 
 
 # In[ ]:
+
 
 
 
