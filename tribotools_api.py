@@ -1783,9 +1783,93 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("tribotools_api:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+# ================= BOT SALES / MERCADO PAGO =================
+import os
+import requests
+from fastapi import Request
+
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
+BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL")
+
+
+@app.post("/bot/order/create")
+def create_order(data: dict):
+    if not MP_ACCESS_TOKEN or not BASE_PUBLIC_URL:
+        return {"error": "Missing env vars"}
+
+    service = data.get("service")
+    telegram_id = data.get("telegram_id")
+
+    SERVICES = {
+        "robo_meet": {
+            "price": 97.00,
+            "credits": 1000,
+            "days": 30,
+            "max_devices": 1
+        }
+    }
+
+    if service not in SERVICES:
+        return {"error": "Serviço inválido"}
+
+    s = SERVICES[service]
+
+    payload = {
+        "transaction_amount": float(s["price"]),
+        "description": f"Licença {service} - TriboTools",
+        "payment_method_id": "pix",
+        "payer": {
+            "email": f"{telegram_id}@telegram.local"
+        },
+        "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago"
+    }
+
+    r = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers={
+            "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=30
+    )
+
+    return r.json()
+
+
+@app.post("/webhooks/mercadopago")
+async def mercadopago_webhook(request: Request):
+    if not MP_ACCESS_TOKEN:
+        return {"status": "missing_mp_token"}
+
+    body = await request.json()
+    payment_id = body.get("data", {}).get("id")
+
+    if not payment_id:
+        return {"status": "ignored"}
+
+    r = requests.get(
+        f"https://api.mercadopago.com/v1/payments/{payment_id}",
+        headers={
+            "Authorization": f"Bearer {MP_ACCESS_TOKEN}"
+        },
+        timeout=30
+    )
+
+    payment = r.json()
+    status = payment.get("status")
+
+    if status != "approved":
+        return {"status": status}
+
+    return {
+        "status": "paid_confirmed",
+        "payment_id": payment_id
+    }
 
 
 # In[ ]:
+
 
 
 
