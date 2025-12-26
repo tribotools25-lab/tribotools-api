@@ -1799,6 +1799,10 @@ def create_order(data: dict):
 
     service = data.get("service")
     telegram_id = data.get("telegram_id")
+    payer_email = data.get("payer_email")
+
+    if not payer_email:
+        return {"error": "payer_email is required"}
 
     SERVICES = {
         "robo_meet": {
@@ -1816,9 +1820,11 @@ def create_order(data: dict):
 
     payload = {
         "transaction_amount": float(s["price"]),
-        "description": f"Licença {service} - TriboTools",
+        "description": f"[BOTv2] Licença {service} - TriboTools",
         "payment_method_id": "pix",
-     "payer": { "email": f"tg{telegram_id}@tribotools.com" },
+        "payer": {
+            "email": payer_email
+        },
         "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago"
     }
 
@@ -1867,6 +1873,7 @@ async def mercadopago_webhook(request: Request):
 
 
 # In[ ]:
+
 
 
 
