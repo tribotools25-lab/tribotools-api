@@ -1787,6 +1787,7 @@ if __name__ == "__main__":
     uvicorn.run("tribotools_api:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
 # ================= BOT SALES / MERCADO PAGO =================
 import os
+import uuid
 import requests
 from fastapi import Request
 
@@ -1800,19 +1801,14 @@ def create_order(data: dict):
         return {"error": "Missing env vars"}
 
     service = data.get("service")
-    telegram_id = data.get("telegram_id")
+    telegram_id = data.get("telegram_id")  # se não usar agora, ok
     payer_email = data.get("payer_email")
 
     if not payer_email:
         return {"error": "payer_email is required"}
 
     SERVICES = {
-        "robo_meet": {
-            "price": 97.00,
-            "credits": 1000,
-            "days": 30,
-            "max_devices": 1
-        }
+        "robo_meet": {"price": 97.00, "credits": 1000, "days": 30, "max_devices": 1}
     }
 
     if service not in SERVICES:
@@ -1824,39 +1820,31 @@ def create_order(data: dict):
         "transaction_amount": float(s["price"]),
         "description": f"[BOTv2] Licença {service} - TriboTools",
         "payment_method_id": "pix",
-        "payer": {
-            "email": payer_email
-        },
-        "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago"
+        "payer": {"email": payer_email},
+        "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago",
     }
+
     idem_key = str(uuid.uuid4())
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": idem_key,
+    }
 
-   import uuid  # garanta que existe no topo do arquivo
-
-idem_key = str(uuid.uuid4())
-
-headers = {
-    "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-    "Content-Type": "application/json",
-    "X-Idempotency-Key": idem_key
-}
-
-r = requests.post(
-    "https://api.mercadopago.com/v1/payments",
-    headers=headers,
-    json=payload,
-    timeout=30
-)
-
-resp = r.json() if r.headers.get("content-type","").startswith("application/json") else {"raw": r.text}
-resp["_debug_idem_key"] = idem_key  # prova que o header foi enviado
-
-return resp
-
-
+    r = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers=headers,
+        json=payload,
+        timeout=30,
     )
 
-    return r.json()
+    # resposta “segura” (às vezes MP pode devolver html/text em erro)
+    content_type = (r.headers.get("content-type") or "").lower()
+    resp = r.json() if content_type.startswith("application/json") else {"raw": r.text}
+    resp["_debug_idem_key"] = idem_key
+    resp["_http_status"] = r.status_code
+
+    return resp
 
 
 @app.post("/webhooks/mercadopago")
@@ -1865,41 +1853,21 @@ async def mercadopago_webhook(request: Request):
         return {"status": "missing_mp_token"}
 
     body = await request.json()
-    payment_id = body.get("data", {}).get("id")
+    payment_id = (body.get("data") or {}).get("id")
 
     if not payment_id:
         return {"status": "ignored"}
 
     r = requests.get(
         f"https://api.mercadopago.com/v1/payments/{payment_id}",
-        headers={
-            "Authorization": f"Bearer {MP_ACCESS_TOKEN}"
-        },
-        timeout=30
+        headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
+        timeout=30,
     )
 
     payment = r.json()
     status = payment.get("status")
 
     if status != "approved":
-        return {"status": status}
+        return {"status": status, "payment_id": payment_id}
 
-    return {
-        "status": "paid_confirmed",
-        "payment_id": payment_id
-    }
-
-
-# In[ ]:
-
-
-
-
-
-
-
-
-
-
-
-
+    return {"status": "paid_confirmed", "payment_id": payment_id}
