@@ -1827,15 +1827,19 @@ def create_order(data: dict):
         },
         "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago"
     }
+    idem_key = str(uuid.uuid4())
 
     r = requests.post(
-        "https://api.mercadopago.com/v1/payments",
-        headers={
-            "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        },
-        json=payload,
-        timeout=30
+    "https://api.mercadopago.com/v1/payments",
+    headers={
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": idem_key
+    },
+    json=payload,
+    timeout=30
+)
+
     )
 
     return r.json()
@@ -1873,6 +1877,7 @@ async def mercadopago_webhook(request: Request):
 
 
 # In[ ]:
+
 
 
 
