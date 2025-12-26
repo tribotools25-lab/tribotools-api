@@ -1818,9 +1818,7 @@ def create_order(data: dict):
         "transaction_amount": float(s["price"]),
         "description": f"Licença {service} - TriboTools",
         "payment_method_id": "pix",
-        "payer": {
-            "email": f"{telegram_id}@telegram.local"
-        },
+     "payer": { "email": f"tg{telegram_id}@tribotools.com" },
         "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago"
     }
 
