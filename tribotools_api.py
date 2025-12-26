@@ -58,6 +58,8 @@ import typing as t
 import uuid
 import io
 import csv
+import uuid
+
 
 from fastapi import FastAPI, HTTPException, Depends, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -1877,6 +1879,7 @@ async def mercadopago_webhook(request: Request):
 
 
 # In[ ]:
+
 
 
 
