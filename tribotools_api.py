@@ -1885,3 +1885,63 @@ async def mercadopago_webhook(request: Request):
 
     return {"status": "paid_confirmed", "payment_id": payment_id}
 
+import os, requests
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL")
+
+def tg_send(chat_id: int, text: str, reply_markup: dict | None = None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    r = requests.post(url, json=payload, timeout=20)
+    return r.json()
+
+@app.post("/webhooks/telegram")
+async def telegram_webhook(update: dict):
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "missing TELEGRAM_BOT_TOKEN"}
+
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
+        return {"ok": True}
+
+    chat_id = msg["chat"]["id"]
+    text = (msg.get("text") or "").strip().lower()
+
+    if text in ("/start", "start"):
+        tg_send(chat_id, "Fala! 👋\nEscolha um produto:\n\n1) Robô Meet (R$97)\n\nDigite: <b>1</b>")
+        return {"ok": True}
+
+    if text == "1":
+        # chama seu próprio create_order
+        payload = {"service":"robo_meet","telegram_id": str(chat_id), "payer_email":"teste@exemplo.com"}
+        # ⚠️ ideal: pedir email pro usuário (faço já já)
+        r = requests.post(f"{BASE_PUBLIC_URL}/bot/order/create", json=payload, timeout=30)
+        data = r.json()
+
+        ticket = (data.get("point_of_interaction", {})
+                    .get("transaction_data", {})
+                    .get("ticket_url"))
+
+        qr = (data.get("point_of_interaction", {})
+                .get("transaction_data", {})
+                .get("qr_code"))
+
+        pay_id = data.get("id")
+
+        if ticket:
+            kb = {"inline_keyboard": [[{"text":"💳 Pagar agora", "url": ticket}]]}
+            tg_send(chat_id, f"✅ Pedido criado!\n\nID: <code>{pay_id}</code>\n\nClique pra pagar:", kb)
+            tg_send(chat_id, f"Pix copia e cola (opcional):\n<code>{qr}</code>" if qr else "QR indisponível.")
+        else:
+            tg_send(chat_id, f"⚠️ Não consegui gerar link de pagamento. Retorno:\n<code>{data}</code>")
+
+        return {"ok": True}
+
+    tg_send(chat_id, "Não entendi. Digite <b>1</b> para Robô Meet.")
+    return {"ok": True}
+
+
+
