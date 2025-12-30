@@ -1,48 +1,22 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[10]:
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-TriboTools License API — VERSÃO FINAL + CRÉDITOS
+TriboTools API (Licenças + Créditos) + Bot Telegram + Mercado Pago PIX
 
-- Licença 1x por máquina (max_devices configurável por licença)
-- Sistema de créditos por licença:
-    - Tabelas: credit_wallet (saldo), credit_tx (histórico)
-    - Endpoints admin:
-        - POST /api/admin/credits/grant
-        - GET  /api/admin/credits/{lic_hash}/history
-    - Endpoints cliente (robô):
-        - GET  /credits/balance?token=...&device_id=...
-        - POST /credits/consume
+ENV VARS (Render):
+- LICENSE_DB
+- ADMIN_TOKEN
+- BASE_PUBLIC_URL              (ex: https://tribotools-api.onrender.com)
+- MP_ACCESS_TOKEN
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_WEBHOOK_SECRET
 
-- Endpoints públicos para o robô:
-    - POST /activate
-    - POST /validate
-    - POST /renew
-    - POST /usage
-    - GET  /stats
-
-- Endpoints admin (protegidos por ADMIN_TOKEN, via Bearer):
-    - POST  /api/admin/licenses                (criar licença)
-    - GET   /api/admin/licenses                (listar)
-    - PATCH /api/admin/licenses/{lic_hash}/status  (ativar/desativar)
-    - POST  /api/admin/licenses/{lic_hash}/revoke   (derrubar geral)
-    - POST  /api/admin/activations/revoke           (derrubar 1 device)
-    - GET   /api/admin/usage-summary          (resumo por licença)
-    - GET   /api/admin/usage-csv              (CSV do resumo)
-    - POST  /api/admin/credits/grant          (adicionar créditos)
-    - GET   /api/admin/credits/{lic_hash}/history  (histórico)
-
-- Painel web em /panel com:
-    - Login por token admin (salvo em localStorage)
-    - Cards de métricas
-    - Tabela de licenças com runs/activations/validations
-    - Botões: criar, ativar/desativar, derrubar, exportar CSV
-    - Campo de busca na tabela
+Fluxo Telegram:
+- /start -> mostra menu
+- seleciona produto -> pede e-mail
+- envia e-mail -> cria PIX (MercadoPago) -> manda QR + copia/cola + link
+- webhook MercadoPago aprovado -> gera licença + créditos -> entrega no Telegram
 """
 
 from __future__ import annotations
@@ -54,41 +28,89 @@ import json
 import os
 import sqlite3
 import threading
-import typing as t
 import uuid
 import io
 import csv
-import uuid
+import re
+import requests
 
-
-from fastapi import FastAPI, HTTPException, Depends, Body, Query
+from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, Response
-from fastapi import Request
+
 import hmac
-from fastapi import Body
 
+API_VERSION = "TT-1.2.0"
 
-
-API_VERSION = "TT-1.1.0"
-
-# ================== ENV / DB ==================
-
+# ================== ENV ==================
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = (BASE_DIR / "licenses.db").resolve()
-DB_PATH = os.getenv("LICENSE_DB", str(DEFAULT_DB))
+
+DB_PATH = os.getenv("LICENSE_DB", str(DEFAULT_DB)).strip()
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL", "").strip().rstrip("/")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
+# ================== COPY / PRODUTOS ==================
+# Edite aqui a copy. Deixa em HTML porque vamos mandar com parse_mode=HTML.
+SALES = {
+    "robo_meet": {
+        "title": "Robô Audiência Google Meet",
+        "price": 97.00,
+        "currency": "BRL",
+        "credits": 1000,
+        "days": 30,
+        "max_devices": 1,
+        "short": (
+            "<b>Robô Audiência Google Meet</b>\n"
+            "• Abre múltiplos perfis e entra na sala automaticamente\n"
+            "• Ideal pra prova social / eventos / lançamentos\n"
+            "• Licença por máquina + <b>1000 créditos</b>\n"
+        )
+    },
+    # Você pode ir adicionando:
+    # "robo_tiktok": {...},
+    # "disparo_agenda": {...},
+}
 
+WELCOME_COPY = (
+    "🚀 <b>Pyratas / TriboTools</b>\n\n"
+    "Aqui você compra e ativa ferramentas oficiais da nossa stack.\n"
+    "✅ Infra estável • ✅ Automação real • ✅ Histórico de entrega\n\n"
+    "Escolha o produto abaixo pra continuar:"
+)
+
+ASK_EMAIL_COPY = (
+    "Perfeito. Agora me manda <b>seu e-mail</b> (o mesmo do pagamento).\n"
+    "Exemplo: nome@dominio.com"
+)
+
+AFTER_PIX_COPY = (
+    "✅ Pagamento PIX criado.\n\n"
+    "1) Escaneie o QR no seu banco ou copie o código\n"
+    "2) Assim que confirmar, eu libero sua licença automaticamente.\n"
+)
+
+DELIVERY_COPY = (
+    "🎉 <b>Pagamento aprovado!</b>\n\n"
+    "Aqui está sua licença e instruções de ativação:\n\n"
+    "<b>Chave:</b> <code>{license_key}</code>\n"
+    "<b>Validade:</b> {days} dias\n"
+    "<b>Créditos:</b> {credits}\n\n"
+    "Se quiser trocar de máquina, me chama aqui que a gente resolve."
+)
+
+# ================== DB ==================
 _conn: sqlite3.Connection | None = None
 _conn_lock = threading.Lock()
 
-
 def connect_once() -> sqlite3.Connection:
-    """Singleton connection."""
     global _conn
     if _conn is None:
         with _conn_lock:
@@ -98,36 +120,28 @@ def connect_once() -> sqlite3.Connection:
                 _conn = conn
     return _conn
 
-
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
 
 def init_db():
     conn = connect_once()
     cur = conn.cursor()
 
-    # Licenças (hash somente)
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS license (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key_hash TEXT UNIQUE,
-            status TEXT DEFAULT 'active',   -- 'active' | 'inactive'
+            status TEXT DEFAULT 'active',
             max_devices INTEGER DEFAULT 1,
             notes TEXT,
             created_at TEXT
         )
-        """
-    )
+    """)
 
-    # Ativações por dispositivo
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS activation (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key_hash TEXT,
@@ -138,12 +152,9 @@ def init_db():
             expires_at TEXT,
             UNIQUE(license_key_hash, device_id)
         )
-        """
-    )
+    """)
 
-    # Métricas
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS usage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT,
@@ -152,15 +163,12 @@ def init_db():
             event TEXT,
             meta TEXT
         )
-        """
-    )
+    """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_license ON usage(license_key_hash)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_device ON usage(device_id)")
 
-    # Carteira de créditos por licença
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS credit_wallet (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key_hash TEXT UNIQUE,
@@ -168,42 +176,67 @@ def init_db():
             created_at TEXT,
             updated_at TEXT
         )
-        """
-    )
+    """)
 
-    # Histórico de transações de créditos
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS credit_tx (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key_hash TEXT,
-            change INTEGER,              -- positivo = crédito, negativo = consumo
+            change INTEGER,
             reason TEXT,
             meta TEXT,
             created_at TEXT
         )
-        """
-    )
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS idx_credit_tx_lic ON credit_tx(license_key_hash)"
-    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_credit_tx_lic ON credit_tx(license_key_hash)")
+
+    # Estado do Telegram (pra saber se o usuário tá “esperando email” etc.)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tg_state (
+            telegram_id TEXT PRIMARY KEY,
+            state TEXT,
+            service TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    # Pedidos
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT,
+            service TEXT,
+            payer_email TEXT,
+            mp_payment_id TEXT,
+            mp_status TEXT,
+            license_key TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(mp_payment_id)
+        )
+    """)
 
     conn.commit()
 
+def ensure_wallet_for_license(lic_hash: str) -> None:
+    conn = connect_once()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
+    if cur.fetchone():
+        return
+    now = now_utc_str()
+    cur.execute(
+        "INSERT INTO credit_wallet (license_key_hash, balance, created_at, updated_at) VALUES (?,?,?,?)",
+        (lic_hash, 0, now, now),
+    )
+    conn.commit()
 
 # ================== ADMIN AUTH ==================
-
 admin_scheme = HTTPBearer(auto_error=False)
 
-
-def require_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(admin_scheme),
-):
+def require_admin(credentials: HTTPAuthorizationCredentials = Depends(admin_scheme)):
     if not ADMIN_TOKEN:
-        raise HTTPException(
-            status_code=500,
-            detail="ADMIN_TOKEN não configurado no servidor.",
-        )
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN não configurado no servidor.")
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Bearer token ausente.")
     token = credentials.credentials.strip()
@@ -211,10 +244,8 @@ def require_admin(
         raise HTTPException(status_code=403, detail="Token inválido.")
     return True
 
-
-# ================== APP / ROUTERS ==================
-
-app = FastAPI(title="TriboTools License API", version=API_VERSION)
+# ================== APP ==================
+app = FastAPI(title="TriboTools API", version=API_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -226,50 +257,152 @@ app.add_middleware(
 core = APIRouter()
 admin = APIRouter(prefix="/admin", tags=["admin"])
 
-
 @app.on_event("startup")
 def _startup():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     init_db()
 
+# ================== TELEGRAM HELPERS ==================
+def tg_api(method: str) -> str:
+    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
-# ================== HELPERS DE CRÉDITO ==================
+def tg_send(chat_id: str | int, text: str, reply_markup: dict | None = None):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        requests.post(tg_api("sendMessage"), json=payload, timeout=20)
+    except Exception:
+        pass
 
+def tg_answer_callback(callback_query_id: str, text: str = ""):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        requests.post(tg_api("answerCallbackQuery"), json=payload, timeout=20)
+    except Exception:
+        pass
 
-def ensure_wallet_for_license(lic_hash: str) -> None:
-    """
-    Garante que exista um registro de carteira para essa licença.
-    """
+def tg_menu_keyboard():
+    buttons = []
+    for k, s in SALES.items():
+        buttons.append([{"text": f"🛒 {s['title']}", "callback_data": f"buy:{k}"}])
+    return {"inline_keyboard": buttons}
+
+def set_tg_state(telegram_id: str, state: str, service: str | None = None):
     conn = connect_once()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id FROM credit_wallet WHERE license_key_hash=?",
-        (lic_hash,),
-    )
-    row = cur.fetchone()
-    if row:
-        return
-    now = now_utc_str()
-    cur.execute(
-        "INSERT INTO credit_wallet (license_key_hash, balance, created_at, updated_at) "
-        "VALUES (?,?,?,?)",
-        (lic_hash, 0, now, now),
+        "INSERT INTO tg_state (telegram_id, state, service, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET state=excluded.state, service=excluded.service, updated_at=excluded.updated_at",
+        (telegram_id, state, service or "", now_utc_str()),
     )
     conn.commit()
 
+def get_tg_state(telegram_id: str) -> dict:
+    conn = connect_once()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id, state, service FROM tg_state WHERE telegram_id=?", (telegram_id,))
+    row = cur.fetchone()
+    if not row:
+        return {"state": "", "service": ""}
+    return {"state": row["state"] or "", "service": row["service"] or ""}
 
-# ================== ROTAS PÚBLICAS ==================
+def clear_tg_state(telegram_id: str):
+    conn = connect_once()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tg_state WHERE telegram_id=?", (telegram_id,))
+    conn.commit()
 
+def is_email(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s))
 
+# ================== MERCADO PAGO ==================
+def mp_create_pix(service: str, telegram_id: str, payer_email: str):
+    if not MP_ACCESS_TOKEN or not BASE_PUBLIC_URL:
+        raise HTTPException(500, "MP_ACCESS_TOKEN ou BASE_PUBLIC_URL não configurado.")
+
+    if service not in SALES:
+        raise HTTPException(400, "Serviço inválido.")
+
+    s = SALES[service]
+    payload = {
+        "transaction_amount": float(s["price"]),
+        "description": f"[BOTv2] Licença {service} - TriboTools",
+        "payment_method_id": "pix",
+        "payer": {"email": payer_email},
+        "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago",
+        "external_reference": f"tg:{telegram_id}|svc:{service}",
+    }
+    idem_key = str(uuid.uuid4())
+
+    r = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers={
+            "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": idem_key,
+        },
+        json=payload,
+        timeout=30,
+    )
+    data = r.json()
+    data["_debug_idem_key"] = idem_key
+    data["_http_status"] = r.status_code
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, data)
+    return data
+
+def mp_get_payment(payment_id: str):
+    r = requests.get(
+        f"https://api.mercadopago.com/v1/payments/{payment_id}",
+        headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
+        timeout=30,
+    )
+    return r.status_code, r.json()
+
+def generate_license_key(prefix="TT"):
+    # chave amigável pro cliente (não só hash)
+    return f"{prefix}-{uuid.uuid4().hex[:6].upper()}-{uuid.uuid4().hex[:6].upper()}"
+
+def upsert_license_and_credits(license_key: str, max_devices: int, credits: int, notes: str = ""):
+    lic_hash = sha256(license_key)
+    conn = connect_once()
+    cur = conn.cursor()
+
+    # cria licença se não existir
+    cur.execute("SELECT id FROM license WHERE license_key_hash=?", (lic_hash,))
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO license (license_key_hash, status, max_devices, notes, created_at) VALUES (?,?,?,?,?)",
+            (lic_hash, "active", int(max_devices or 1), notes, now_utc_str()),
+        )
+        conn.commit()
+
+    ensure_wallet_for_license(lic_hash)
+
+    # adiciona créditos
+    now = now_utc_str()
+    cur.execute(
+        "UPDATE credit_wallet SET balance = balance + ?, updated_at=? WHERE license_key_hash=?",
+        (int(credits or 0), now, lic_hash),
+    )
+    cur.execute(
+        "INSERT INTO credit_tx (license_key_hash, change, reason, meta, created_at) VALUES (?,?,?,?,?)",
+        (lic_hash, int(credits or 0), "purchase", json.dumps({"license_key": license_key}), now),
+    )
+    conn.commit()
+
+# ================== ROTAS CORE ==================
 @core.get("/")
 def home():
-    return {
-        "status": "ok",
-        "msg": "TriboTools API rodando",
-        "version": API_VERSION,
-        "db_path": DB_PATH,
-    }
-
+    return {"status": "ok", "msg": "TriboTools API rodando", "version": API_VERSION}
 
 @core.get("/healthz")
 def healthz():
@@ -279,46 +412,108 @@ def healthz():
     tables = [r["name"] for r in cur.fetchall()]
     return {"ok": True, "tables": tables, "db_path": str(DB_PATH)}
 
-
 @core.post("/webhooks/telegram")
-async def telegram_webhook(
-    update: dict = Body(...),
-    request: Request = None
-):
-    # Segurança opcional por header (recomendado)
+async def telegram_webhook(update: dict = Body(...), request: Request = None):
+    # valida secret do Telegram (você já setou no setWebhook)
     if TELEGRAM_WEBHOOK_SECRET:
         received = (request.headers.get("x-telegram-bot-api-secret-token") or "").strip()
         if not received or not hmac.compare_digest(received, TELEGRAM_WEBHOOK_SECRET):
             raise HTTPException(status_code=401, detail="Webhook secret inválido.")
 
-    # Log básico
+    # log mínimo
     conn = connect_once()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) VALUES (?,?,?,?,?)",
-        (
-            now_utc_str(),
-            "TELEGRAM",
-            "WEBHOOK",
-            "telegram_update",
-            json.dumps({"update_id": update.get("update_id")}, ensure_ascii=False),
-        ),
+        (now_utc_str(), "TELEGRAM", "WEBHOOK", "telegram_update",
+         json.dumps({"update_id": update.get("update_id")}, ensure_ascii=False)),
     )
     conn.commit()
 
+    # --- mensagem normal ---
+    message = update.get("message") or update.get("edited_message")
+    if message and message.get("chat"):
+        chat_id = message["chat"]["id"]
+        text = (message.get("text") or "").strip()
+        telegram_id = str(chat_id)
+
+        # /start
+        if text.startswith("/start"):
+            clear_tg_state(telegram_id)
+            tg_send(chat_id, WELCOME_COPY, reply_markup=tg_menu_keyboard())
+            return {"ok": True}
+
+        # se está aguardando e-mail:
+        st = get_tg_state(telegram_id)
+        if st.get("state") == "awaiting_email":
+            if not is_email(text):
+                tg_send(chat_id, "⚠️ Esse e-mail parece inválido. Me manda no formato <b>nome@dominio.com</b>.")
+                return {"ok": True}
+
+            service = st.get("service")
+            if service not in SALES:
+                clear_tg_state(telegram_id)
+                tg_send(chat_id, "⚠️ Serviço inválido. Use /start e escolha de novo.")
+                return {"ok": True}
+
+            # cria PIX
+            pay = mp_create_pix(service=service, telegram_id=telegram_id, payer_email=text)
+            payment_id = str(pay.get("id"))
+
+            # salva pedido
+            cur.execute(
+                "INSERT INTO orders (telegram_id, service, payer_email, mp_payment_id, mp_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (telegram_id, service, text, payment_id, pay.get("status") or "pending", now_utc_str(), now_utc_str()),
+            )
+            conn.commit()
+
+            poi = (pay.get("point_of_interaction") or {}).get("transaction_data") or {}
+            qr = poi.get("qr_code")
+            ticket_url = poi.get("ticket_url")
+
+            msg = AFTER_PIX_COPY
+            if ticket_url:
+                msg += f"\n\n🔗 <b>Link do pagamento:</b>\n{ticket_url}"
+            if qr:
+                msg += f"\n\n<b>PIX Copia e Cola:</b>\n<code>{qr}</code>"
+
+            tg_send(chat_id, msg)
+            clear_tg_state(telegram_id)
+            return {"ok": True}
+
+        # fallback
+        tg_send(chat_id, "Digite /start para ver os produtos.")
+        return {"ok": True}
+
+    # --- callback (botões) ---
+    cb = update.get("callback_query")
+    if cb:
+        cb_id = cb.get("id")
+        chat = (cb.get("message") or {}).get("chat") or {}
+        chat_id = chat.get("id")
+        telegram_id = str(chat_id)
+        data = (cb.get("data") or "").strip()
+
+        if data.startswith("buy:"):
+            service = data.split("buy:", 1)[1].strip()
+            if service not in SALES:
+                tg_answer_callback(cb_id, "Serviço inválido.")
+                return {"ok": True}
+
+            tg_answer_callback(cb_id, "Certo!")
+            tg_send(chat_id, SALES[service]["short"])
+            tg_send(chat_id, ASK_EMAIL_COPY)
+            set_tg_state(telegram_id, "awaiting_email", service=service)
+            return {"ok": True}
+
+        tg_answer_callback(cb_id, "Ok.")
+        return {"ok": True}
+
     return {"ok": True}
 
-
-
-# -------- LICENÇA: CLIENTE --------
-
-
+# ================== LICENÇA / CRÉDITOS (mantive seu core) ==================
 @core.post("/activate")
 def activate(data: dict = Body(...)):
-    """
-    body: { license_key, device_id, fingerprint, ... }
-    - compatível com o robô (pode mandar client_version, product etc.)
-    """
     license_key = (data.get("license_key") or "").strip()
     device_id = (data.get("device_id") or "").strip()
     fingerprint = data.get("fingerprint", {})
@@ -330,11 +525,7 @@ def activate(data: dict = Body(...)):
     conn = connect_once()
     cur = conn.cursor()
 
-    # verifica licença
-    cur.execute(
-        "SELECT status, max_devices FROM license WHERE license_key_hash=?",
-        (lic_hash,),
-    )
+    cur.execute("SELECT status, max_devices FROM license WHERE license_key_hash=?", (lic_hash,))
     row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Licença inválida.")
@@ -342,78 +533,36 @@ def activate(data: dict = Body(...)):
         raise HTTPException(403, "Licença inativa.")
     max_devices = row["max_devices"] or 1
 
-    # conta devices já usados
-    cur.execute(
-        "SELECT COUNT(*) AS c FROM activation WHERE license_key_hash=?",
-        (lic_hash,),
-    )
+    cur.execute("SELECT COUNT(*) AS c FROM activation WHERE license_key_hash=?", (lic_hash,))
     qtd = cur.fetchone()["c"]
 
     if qtd >= max_devices:
-        # permite reusar no MESMO device_id
-        cur.execute(
-            "SELECT 1 FROM activation WHERE license_key_hash=? AND device_id=?",
-            (lic_hash, device_id),
-        )
+        cur.execute("SELECT 1 FROM activation WHERE license_key_hash=? AND device_id=?", (lic_hash, device_id))
         if cur.fetchone() is None:
-            raise HTTPException(
-                403, "Licença já está em uso em outro computador."
-            )
+            raise HTTPException(403, "Licença já está em uso em outro computador.")
 
     token = str(uuid.uuid4())
     now = now_utc_str()
-    expires_at = (datetime.utcnow() + timedelta(days=30)).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    expires_at = (datetime.utcnow() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
-    cur.execute(
-        """
+    cur.execute("""
         INSERT OR REPLACE INTO activation
             (license_key_hash, device_id, token, fingerprint, activated_at, expires_at)
         VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            lic_hash,
-            device_id,
-            token,
-            json.dumps(fingerprint, ensure_ascii=False),
-            now,
-            expires_at,
-        ),
-    )
+    """, (lic_hash, device_id, token, json.dumps(fingerprint, ensure_ascii=False), now, expires_at))
     conn.commit()
 
-    # registra uso
     cur.execute(
-        "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) "
-        "VALUES (?,?,?,?,?)",
-        (
-            now,
-            lic_hash,
-            device_id,
-            "activate",
-            json.dumps({"fingerprint": fingerprint}, ensure_ascii=False),
-        ),
+        "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) VALUES (?,?,?,?,?)",
+        (now, lic_hash, device_id, "activate",
+         json.dumps({"fingerprint": fingerprint}, ensure_ascii=False)),
     )
     conn.commit()
 
-    return {
-        "status": "ok",
-        "token": token,
-        "expires_at": expires_at,
-        "max_devices": max_devices,
-    }
-
+    return {"status": "ok", "token": token, "expires_at": expires_at, "max_devices": max_devices}
 
 @core.post("/validate")
 def validate(data: dict = Body(...)):
-    """
-    body: { token, device_id }
-    Verifica:
-      - se o token existe
-      - se a licença está ativa
-      - se não expirou
-    """
     token = (data.get("token") or "").strip()
     device_id = (data.get("device_id") or "").strip()
     if not token or not device_id:
@@ -421,18 +570,12 @@ def validate(data: dict = Body(...)):
 
     conn = connect_once()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT
-            a.license_key_hash,
-            a.expires_at,
-            l.status AS lic_status
+    cur.execute("""
+        SELECT a.license_key_hash, a.expires_at, l.status AS lic_status
         FROM activation a
         LEFT JOIN license l ON l.license_key_hash = a.license_key_hash
         WHERE a.token = ? AND a.device_id = ?
-        """,
-        (token, device_id),
-    )
+    """, (token, device_id))
     row = cur.fetchone()
     if not row:
         return {"valid": False, "reason": "Token não encontrado."}
@@ -441,7 +584,6 @@ def validate(data: dict = Body(...)):
     lic_status = (row["lic_status"] or "active").lower()
     exp = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
 
-    # Decide o resultado
     if lic_status != "active":
         valid = False
         reason = "Licença desativada pelo administrador."
@@ -455,122 +597,37 @@ def validate(data: dict = Body(...)):
         reason = "Token válido."
         event_name = "validate_ok"
 
-    # Log no usage
     cur.execute(
         "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) VALUES (?,?,?,?,?)",
-        (
-            now_utc_str(),
-            lic_hash,
-            device_id,
-            event_name,
-            json.dumps({"reason": reason}, ensure_ascii=False),
-        ),
+        (now_utc_str(), lic_hash, device_id, event_name, json.dumps({"reason": reason}, ensure_ascii=False)),
     )
     conn.commit()
 
     return {"valid": valid, "reason": reason}
 
-
-@core.post("/renew")
-def renew(data: dict = Body(...)):
-    """
-    body: { token, device_id }
-    - opcional, se você quiser renovar 30 dias via painel/robô.
-    """
-    token = (data.get("token") or "").strip()
-    device_id = (data.get("device_id") or "").strip()
-    if not token or not device_id:
-        raise HTTPException(400, "Campos obrigatórios: token, device_id.")
-
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT license_key_hash FROM activation WHERE token=? AND device_id=?",
-        (token, device_id),
-    )
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, "Ativação não encontrada.")
-
-    new_exp = (datetime.utcnow() + timedelta(days=30)).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-    cur.execute("UPDATE activation SET expires_at=? WHERE token=?", (new_exp, token))
-    conn.commit()
-
-    cur.execute(
-        "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) "
-        "VALUES (?,?,?,?,?)",
-        (
-            now_utc_str(),
-            row["license_key_hash"],
-            device_id,
-            "renew",
-            json.dumps({"new_expires_at": new_exp}, ensure_ascii=False),
-        ),
-    )
-    conn.commit()
-
-    return {"status": "ok", "new_expires_at": new_exp}
-
-
-# -------- CRÉDITOS: CLIENTE (ROBÔ) --------
-
-
 @core.get("/credits/balance")
 def credits_balance(token: str = Query(...), device_id: str = Query(...)):
-    """
-    Retorna saldo de créditos para o token + device_id.
-    Útil para o robô (cliente) saber se pode disparar.
-    """
     conn = connect_once()
     cur = conn.cursor()
 
     token = token.strip()
     device_id = device_id.strip()
 
-    cur.execute(
-        "SELECT license_key_hash, expires_at FROM activation WHERE token=? AND device_id=?",
-        (token, device_id),
-    )
+    cur.execute("SELECT license_key_hash, expires_at FROM activation WHERE token=? AND device_id=?", (token, device_id))
     row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Ativação não encontrada para este token/device_id.")
 
-    # checa expiração (opcional, mas recomendado)
-    try:
-        exp = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
-        if datetime.utcnow() > exp:
-            raise HTTPException(403, "Token expirado.")
-    except Exception:
-        pass
-
     lic_hash = row["license_key_hash"]
     ensure_wallet_for_license(lic_hash)
 
-    cur.execute(
-        "SELECT balance FROM credit_wallet WHERE license_key_hash=?",
-        (lic_hash,),
-    )
+    cur.execute("SELECT balance FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
     row2 = cur.fetchone()
     balance = row2["balance"] if row2 else 0
-
     return {"license_key_hash": lic_hash, "balance": balance}
-
 
 @core.post("/credits/consume")
 def credits_consume(data: dict = Body(...)):
-    """
-    Consome créditos a partir do token + device_id.
-    body:
-      {
-        "token": "...",
-        "device_id": "...",
-        "amount": 123,
-        "reason": "disparo_google_agenda",
-        "meta": { ... }  # opcional (ex: id da campanha)
-      }
-    """
     token = (data.get("token") or "").strip()
     device_id = (data.get("device_id") or "").strip()
     amount = int(data.get("amount", 0))
@@ -585,190 +642,115 @@ def credits_consume(data: dict = Body(...)):
     conn = connect_once()
     cur = conn.cursor()
 
-    # resolve license_hash a partir do token+device_id
-    cur.execute(
-        "SELECT license_key_hash, expires_at FROM activation WHERE token=? AND device_id=?",
-        (token, device_id),
-    )
+    cur.execute("SELECT license_key_hash FROM activation WHERE token=? AND device_id=?", (token, device_id))
     row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Ativação não encontrada para este token/device_id.")
 
-    # checa expiração
-    try:
-        exp = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
-        if datetime.utcnow() > exp:
-            raise HTTPException(403, "Token expirado.")
-    except Exception:
-        pass
-
     lic_hash = row["license_key_hash"]
     ensure_wallet_for_license(lic_hash)
 
-    # checa saldo
-    cur.execute(
-        "SELECT balance FROM credit_wallet WHERE license_key_hash=?",
-        (lic_hash,),
-    )
+    cur.execute("SELECT balance FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
     row2 = cur.fetchone()
     balance = row2["balance"] if row2 else 0
 
     if balance < amount:
-        # 402 Payment Required = perfeito semanticamente aqui
         raise HTTPException(402, f"Créditos insuficientes. Saldo atual: {balance}, necessário: {amount}")
 
     now = now_utc_str()
+    cur.execute("UPDATE credit_wallet SET balance = balance - ?, updated_at=? WHERE license_key_hash=?",
+                (amount, now, lic_hash))
+    cur.execute("INSERT INTO credit_tx (license_key_hash, change, reason, meta, created_at) VALUES (?,?,?,?,?)",
+                (lic_hash, -amount, reason, meta, now))
+    conn.commit()
 
-    # debita
+    cur.execute("SELECT balance FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
+    new_balance = (cur.fetchone() or {}).get("balance", 0)
+
+    return {"status": "ok", "license_key_hash": lic_hash, "debited": amount, "balance": new_balance}
+
+# ================== MERCADO PAGO WEBHOOK ==================
+@core.post("/webhooks/mercadopago")
+async def mercadopago_webhook(request: Request):
+    if not MP_ACCESS_TOKEN:
+        return {"status": "missing_mp_token"}
+
+    body = await request.json()
+
+    # MercadoPago costuma mandar { "data": {"id": ...} } (como você mostrou)
+    payment_id = (body.get("data") or {}).get("id")
+    if not payment_id:
+        return {"status": "ignored"}
+
+    code, payment = mp_get_payment(str(payment_id))
+    if code >= 400:
+        return {"status": "mp_error", "http": code, "payment_id": payment_id, "mp": payment}
+
+    status = payment.get("status") or ""
+    ext_ref = payment.get("external_reference") or ""
+
+    # atualiza pedido
+    conn = connect_once()
+    cur = conn.cursor()
     cur.execute(
-        "UPDATE credit_wallet SET balance = balance - ?, updated_at=? WHERE license_key_hash=?",
-        (amount, now, lic_hash),
-    )
-    cur.execute(
-        "INSERT INTO credit_tx (license_key_hash, change, reason, meta, created_at) "
-        "VALUES (?,?,?,?,?)",
-        (lic_hash, -amount, reason, meta, now),
+        "UPDATE orders SET mp_status=?, updated_at=? WHERE mp_payment_id=?",
+        (status, now_utc_str(), str(payment_id)),
     )
     conn.commit()
 
-    # saldo final
-    cur.execute(
-        "SELECT balance FROM credit_wallet WHERE license_key_hash=?",
-        (lic_hash,),
+    if status != "approved":
+        return {"status": status, "payment_id": payment_id}
+
+    # extrai tg e svc
+    # ext_ref = "tg:123|svc:robo_meet"
+    tg_id = ""
+    svc = ""
+    try:
+        parts = ext_ref.split("|")
+        for p in parts:
+            if p.startswith("tg:"):
+                tg_id = p.split("tg:", 1)[1]
+            if p.startswith("svc:"):
+                svc = p.split("svc:", 1)[1]
+    except Exception:
+        pass
+
+    if not tg_id or svc not in SALES:
+        return {"status": "approved_but_missing_ref", "payment_id": payment_id, "external_reference": ext_ref}
+
+    # já entregou?
+    cur.execute("SELECT license_key FROM orders WHERE mp_payment_id=?", (str(payment_id),))
+    row = cur.fetchone()
+    if row and row["license_key"]:
+        return {"status": "already_delivered", "payment_id": payment_id}
+
+    # gera licença e aplica créditos
+    s = SALES[svc]
+    license_key = generate_license_key(prefix="TT")
+    upsert_license_and_credits(
+        license_key=license_key,
+        max_devices=s.get("max_devices", 1),
+        credits=s.get("credits", 0),
+        notes=f"Order MP:{payment_id} tg:{tg_id} svc:{svc}",
     )
-    row3 = cur.fetchone()
-    new_balance = row3["balance"] if row3 else 0
 
-    return {
-        "status": "ok",
-        "license_key_hash": lic_hash,
-        "debited": amount,
-        "balance": new_balance,
-    }
-
-
-# -------- LISTAGENS PÚBLICAS ÚTEIS --------
-
-
-@core.get("/licenses")
-def list_licenses_public():
-    """Lista básica (sem notas) – útil para debug rápido."""
-    conn = connect_once()
-    cur = conn.cursor()
     cur.execute(
-        "SELECT license_key_hash, status, max_devices "
-        "FROM license ORDER BY id DESC"
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    return {"count": len(rows), "licenses": rows}
-
-
-@core.get("/activations")
-def list_activations(limit: int = 100):
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, license_key_hash, device_id, token, activated_at, expires_at
-        FROM activation
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (max(1, min(limit, 1000)),),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    return {"rows": rows}
-
-
-@core.get("/activations/by-license/{lic_hash}")
-def activations_by_license(lic_hash: str, limit: int = 200):
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, device_id, token, activated_at, expires_at
-        FROM activation
-        WHERE license_key_hash=?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (lic_hash, max(1, min(limit, 2000))),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    return {"license_key_hash": lic_hash, "rows": rows}
-
-
-@core.post("/usage")
-def add_usage(data: dict = Body(...)):
-    """
-    body: { license_key_hash, device_id, event='run', meta: {...} }
-    - compatível com ping_usage do robô.
-    """
-    lic_hash = (data.get("license_key_hash") or "").strip()
-    device_id = (data.get("device_id") or "").strip()
-    event = (data.get("event") or "run").strip()
-    meta = json.dumps(data.get("meta", {}), ensure_ascii=False)
-    if not lic_hash or not device_id:
-        raise HTTPException(
-            400, "license_key_hash e device_id obrigatórios."
-        )
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) "
-        "VALUES (?,?,?,?,?)",
-        (now_utc_str(), lic_hash, device_id, event, meta),
+        "UPDATE orders SET license_key=?, updated_at=? WHERE mp_payment_id=?",
+        (license_key, now_utc_str(), str(payment_id)),
     )
     conn.commit()
-    return {"status": "ok"}
 
-
-@core.get("/stats")
-def stats():
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM license")
-    total_licenses = cur.fetchone()["c"]
-    cur.execute(
-        "SELECT COUNT(*) AS c FROM activation "
-        "WHERE datetime(expires_at) > datetime('now')"
+    # entrega no telegram
+    tg_send(
+        tg_id,
+        DELIVERY_COPY.format(license_key=license_key, days=s.get("days", 30), credits=s.get("credits", 0)),
     )
-    active_activations = cur.fetchone()["c"]
-    cur.execute(
-        "SELECT COUNT(DISTINCT device_id) AS c FROM activation "
-        "WHERE datetime(expires_at) > datetime('now')"
-    )
-    unique_devices = cur.fetchone()["c"]
-    cur.execute(
-        """
-        SELECT COUNT(*) AS c FROM activation
-        WHERE datetime(expires_at) BETWEEN datetime('now')
-                                      AND datetime('now','+7 days')
-        """
-    )
-    expiring_7d = cur.fetchone()["c"]
-    cur.execute(
-        "SELECT COUNT(*) AS c FROM usage "
-        "WHERE datetime(ts) > datetime('now','-1 day')"
-    )
-    usage_24h = cur.fetchone()["c"]
-    return {
-        "total_licenses": total_licenses,
-        "active_activations": active_activations,
-        "unique_devices": unique_devices,
-        "expiring_7d": expiring_7d,
-        "usage_24h": usage_24h,
-    }
 
+    return {"status": "paid_confirmed", "payment_id": payment_id, "delivered": True}
 
-# ================== ROTAS ADMIN ==================
-
-
+# ================== ADMIN (mínimo) ==================
 @admin.post("/licenses", dependencies=[Depends(require_admin)])
 def create_license(body: dict = Body(...)):
-    """
-    body: { "license_key": "TT-XXXX", "max_devices": 1, "notes": "opcional" }
-    """
     lk = (body.get("license_key") or "").strip()
     if not lk:
         raise HTTPException(400, "license_key obrigatório")
@@ -780,1168 +762,39 @@ def create_license(body: dict = Body(...)):
     cur = conn.cursor()
     try:
         cur.execute(
-            "INSERT INTO license (license_key_hash, status, max_devices, notes, created_at) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT INTO license (license_key_hash, status, max_devices, notes, created_at) VALUES (?,?,?,?,?)",
             (lic_hash, "active", max_dev, notes, now_utc_str()),
         )
         conn.commit()
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Licença já existe")
 
-    # já cria carteira vazia
     ensure_wallet_for_license(lic_hash)
-
     return {"status": "ok", "license_key_hash": lic_hash, "max_devices": max_dev}
 
-
-@admin.patch("/licenses/{lic_hash}/status", dependencies=[Depends(require_admin)])
-def set_license_status(lic_hash: str, body: dict = Body(...)):
-    """
-    body: { "status": "active" | "inactive" }
-    """
-    status = (body.get("status") or "").strip().lower()
-    if status not in ("active", "inactive"):
-        raise HTTPException(400, "status deve ser 'active' ou 'inactive'")
+@core.get("/stats")
+def stats():
     conn = connect_once()
     cur = conn.cursor()
-    cur.execute("UPDATE license SET status=? WHERE license_key_hash=?", (status, lic_hash))
-    if cur.rowcount == 0:
-        raise HTTPException(404, "Licença não encontrada")
-    conn.commit()
-    return {"status": "ok", "license_key_hash": lic_hash, "new_status": status}
-
-
-@admin.get("/licenses", dependencies=[Depends(require_admin)])
-def list_licenses_admin():
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT license_key_hash, status, max_devices, created_at, notes "
-        "FROM license ORDER BY id DESC"
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    return {"count": len(rows), "licenses": rows}
-
-
-@admin.post("/licenses/{lic_hash}/revoke", dependencies=[Depends(require_admin)])
-def revoke_license(lic_hash: str):
-    """
-    Revoga todas as ativações dessa licença:
-      - apaga tokens da tabela activation
-      - marca licença como 'inactive'
-    Resultado: ninguém mais valida nem reativa essa chave.
-    """
-    conn = connect_once()
-    cur = conn.cursor()
-
-    cur.execute("DELETE FROM activation WHERE license_key_hash = ?", (lic_hash,))
-    deletadas = cur.rowcount
-
-    cur.execute("UPDATE license SET status='inactive' WHERE license_key_hash = ?", (lic_hash,))
-    conn.commit()
-
+    cur.execute("SELECT COUNT(*) AS c FROM license")
+    total_licenses = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM activation WHERE datetime(expires_at) > datetime('now')")
+    active_activations = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(DISTINCT device_id) AS c FROM activation WHERE datetime(expires_at) > datetime('now')")
+    unique_devices = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM usage WHERE datetime(ts) > datetime('now','-1 day')")
+    usage_24h = cur.fetchone()["c"]
     return {
-        "status": "ok",
-        "license_key_hash": lic_hash,
-        "activations_removed": deletadas,
-        "new_status": "inactive",
+        "total_licenses": total_licenses,
+        "active_activations": active_activations,
+        "unique_devices": unique_devices,
+        "usage_24h": usage_24h,
     }
-
-
-@admin.post("/activations/revoke", dependencies=[Depends(require_admin)])
-def revoke_activation(body: dict = Body(...)):
-    """
-    Revoga UMA ativação específica.
-    body: { "token": "...", "device_id": "..." }
-    """
-    token = (body.get("token") or "").strip()
-    device_id = (body.get("device_id") or "").strip()
-    if not token or not device_id:
-        raise HTTPException(400, "token e device_id são obrigatórios.")
-
-    conn = connect_once()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT license_key_hash FROM activation WHERE token=? AND device_id=?",
-        (token, device_id),
-    )
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, "Ativação não encontrada.")
-
-    lic_hash = row["license_key_hash"]
-
-    cur.execute(
-        "DELETE FROM activation WHERE token=? AND device_id=?",
-        (token, device_id),
-    )
-    deletadas = cur.rowcount
-    conn.commit()
-
-    return {
-        "status": "ok",
-        "license_key_hash": lic_hash,
-        "token": token,
-        "device_id": device_id,
-        "activations_removed": deletadas,
-    }
-
-
-@admin.get("/usage-summary", dependencies=[Depends(require_admin)])
-def usage_summary():
-    """
-    Resumo por licença:
-    - status, max_devices, notes
-    - credits_balance
-    - total_events
-    - runs (run_start)
-    - activations (activate)
-    - validations (validate_ok)
-    - unique_devices
-    """
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT
-            l.license_key_hash,
-            l.status,
-            l.max_devices,
-            COALESCE(l.notes, '') AS notes,
-            COALESCE(cw.balance, 0) AS credits_balance,
-            COUNT(u.id)                           AS total_events,
-            SUM(CASE WHEN u.event='run_start' THEN 1 ELSE 0 END) AS runs,
-            SUM(CASE WHEN u.event='activate' THEN 1 ELSE 0 END)  AS activations,
-            SUM(CASE WHEN u.event='validate_ok' THEN 1 ELSE 0 END) AS validations,
-            COUNT(DISTINCT CASE WHEN u.device_id IS NOT NULL THEN u.device_id END) AS devices
-        FROM license l
-        LEFT JOIN usage u ON u.license_key_hash = l.license_key_hash
-        LEFT JOIN credit_wallet cw ON cw.license_key_hash = l.license_key_hash
-        GROUP BY l.license_key_hash, l.status, l.max_devices, l.notes, cw.balance
-        ORDER BY runs DESC, activations DESC, l.license_key_hash ASC
-        """
-    )
-    rows = []
-    for r in cur.fetchall():
-        rows.append(
-            {
-                "license_key_hash": r["license_key_hash"],
-                "status": r["status"],
-                "max_devices": r["max_devices"],
-                "notes": r["notes"],
-                "credits_balance": r["credits_balance"] or 0,
-                "total_events": r["total_events"] or 0,
-                "runs": r["runs"] or 0,
-                "activations": r["activations"] or 0,
-                "validations": r["validations"] or 0,
-                "devices": r["devices"] or 0,
-            }
-        )
-    return {"rows": rows, "count": len(rows)}
-
-
-@admin.get("/usage-csv", dependencies=[Depends(require_admin)])
-def usage_csv():
-    """
-    Exporta o mesmo resumo do usage-summary em CSV.
-    """
-    summary = usage_summary()  # já faz a query
-    rows: list[dict] = summary["rows"]
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "license_key_hash",
-            "status",
-            "max_devices",
-            "devices",
-            "runs",
-            "activations",
-            "validations",
-            "total_events",
-            "credits_balance",
-            "notes",
-        ]
-    )
-    for r in rows:
-        writer.writerow(
-            [
-                r["license_key_hash"],
-                r["status"],
-                r["max_devices"],
-                r["devices"],
-                r["runs"],
-                r["activations"],
-                r["validations"],
-                r["total_events"],
-                r.get("credits_balance", 0),
-                (r["notes"] or "").replace("\n", " ").replace("\r", " "),
-            ]
-        )
-
-    csv_bytes = output.getvalue().encode("utf-8-sig")
-    headers = {
-        "Content-Disposition": 'attachment; filename="tribotools_usage_summary.csv"'
-    }
-    return Response(content=csv_bytes, media_type="text/csv", headers=headers)
-
-
-# -------- CRÉDITOS: ADMIN --------
-
-
-@admin.post("/credits/grant", dependencies=[Depends(require_admin)])
-def grant_credits(body: dict = Body(...)):
-    """
-    Adiciona créditos para uma licença.
-
-    body:
-      {
-        "license_key": "TT-XXXX-...",
-        "amount": 1000,
-        "reason": "Compra pacote 1.000 disparos",
-        "meta": {...}  # opcional
-      }
-    """
-    lk = (body.get("license_key") or "").strip()
-    if not lk:
-        raise HTTPException(400, "license_key obrigatório")
-    amount = int(body.get("amount", 0))
-    if amount == 0:
-        raise HTTPException(400, "amount deve ser diferente de zero")
-    if amount < 0:
-        raise HTTPException(400, "use amount positivo aqui (crédito); consumo é via /credits/consume")
-
-    reason = (body.get("reason") or "").strip() or "grant"
-    meta = json.dumps(body.get("meta", {}), ensure_ascii=False)
-
-    lic_hash = sha256(lk)
-
-    conn = connect_once()
-    cur = conn.cursor()
-
-    # verifica se licença existe
-    cur.execute(
-        "SELECT id FROM license WHERE license_key_hash=?",
-        (lic_hash,),
-    )
-    if cur.fetchone() is None:
-        raise HTTPException(404, "Licença não encontrada")
-
-    ensure_wallet_for_license(lic_hash)
-
-    # atualiza saldo
-    now = now_utc_str()
-    cur.execute(
-        "UPDATE credit_wallet SET balance = balance + ?, updated_at=? WHERE license_key_hash=?",
-        (amount, now, lic_hash),
-    )
-
-    # log transação
-    cur.execute(
-        "INSERT INTO credit_tx (license_key_hash, change, reason, meta, created_at) "
-        "VALUES (?,?,?,?,?)",
-        (lic_hash, amount, reason, meta, now),
-    )
-    conn.commit()
-
-    # retorna saldo atualizado
-    cur.execute(
-        "SELECT balance FROM credit_wallet WHERE license_key_hash=?",
-        (lic_hash,),
-    )
-    row = cur.fetchone()
-    balance = row["balance"] if row else 0
-
-    return {
-        "status": "ok",
-        "license_key_hash": lic_hash,
-        "added": amount,
-        "balance": balance,
-    }
-
-
-@admin.get("/credits/{lic_hash}/history", dependencies=[Depends(require_admin)])
-def credits_history_admin(lic_hash: str, limit: int = 100):
-    """
-    Histórico de créditos para uma licença (usando license_key_hash já calculado).
-    """
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT change, reason, meta, created_at
-        FROM credit_tx
-        WHERE license_key_hash=?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (lic_hash, max(1, min(limit, 1000))),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-
-    cur.execute(
-        "SELECT balance FROM credit_wallet WHERE license_key_hash=?",
-        (lic_hash,),
-    )
-    row = cur.fetchone()
-    balance = row["balance"] if row else 0
-
-    return {"license_key_hash": lic_hash, "balance": balance, "history": rows}
-
-
-# ================== PAINEL HTML ==================
-
-
-@core.get("/panel", response_class=HTMLResponse)
-def panel():
-    """
-    Painel visual:
-    - salva ADMIN_TOKEN em localStorage
-    - mostra stats
-    - mostra resumo de uso por licença
-    - cria nova licença
-    - exporta CSV de usage-summary
-    - campo de busca
-    """
-    html = """
-    <!DOCTYPE html>
-    <html lang="pt-br">
-    <head>
-      <meta charset="UTF-8" />
-      <title>TriboTools - Painel de Licenças</title>
-      <style>
-        body {
-          margin: 0;
-          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          background: #050816;
-          color: #f9fafb;
-        }
-        header {
-          padding: 16px 24px;
-          background: #020617;
-          border-bottom: 1px solid #1f2933;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        }
-        header h1 {
-          font-size: 20px;
-          margin: 0;
-        }
-        .badge {
-          font-size: 11px;
-          padding: 4px 8px;
-          border-radius: 999px;
-          background: #111827;
-          border: 1px solid #4b5563;
-        }
-        main {
-          padding: 20px 24px 40px 24px;
-          max-width: 1200px;
-          margin: 0 auto;
-        }
-        .token-box {
-          display: flex;
-          gap: 8px;
-          align-items: center;
-          margin-bottom: 20px;
-          flex-wrap: wrap;
-        }
-        .token-box label {
-          font-size: 13px;
-          color: #9ca3af;
-        }
-        .token-box input {
-          background: #020617;
-          border-radius: 999px;
-          border: 1px solid #4b5563;
-          padding: 6px 12px;
-          color: #e5e7eb;
-          min-width: 260px;
-          outline: none;
-        }
-        .token-box button {
-          border-radius: 999px;
-          border: none;
-          padding: 6px 14px;
-          font-size: 13px;
-          cursor: pointer;
-          background: #22c55e;
-          color: #022c22;
-          font-weight: 600;
-        }
-        .token-box button.secondary {
-          background: #111827;
-          color: #e5e7eb;
-          border: 1px solid #374151;
-        }
-        .token-status {
-          font-size: 12px;
-          color: #9ca3af;
-        }
-        .cards {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-          gap: 12px;
-          margin-bottom: 24px;
-        }
-        .card {
-          padding: 14px 16px;
-          border-radius: 16px;
-          background: radial-gradient(circle at top left, #1f2933, #020617);
-          border: 1px solid #1f2937;
-        }
-        .card h3 {
-          margin: 0 0 4px 0;
-          font-size: 13px;
-          color: #9ca3af;
-        }
-        .card .value {
-          font-size: 22px;
-          font-weight: 600;
-        }
-        .card .sub {
-          font-size: 11px;
-          color: #6b7280;
-          margin-top: 4px;
-        }
-        .section {
-          margin-top: 20px;
-          margin-bottom: 4px;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          gap: 8px;
-        }
-        .section-title {
-          font-size: 14px;
-          color: #e5e7eb;
-        }
-        .section-sub {
-          font-size: 12px;
-          color: #6b7280;
-        }
-        .pill {
-          display: inline-flex;
-          align-items: center;
-          gap: 4px;
-          padding: 2px 8px;
-          border-radius: 999px;
-          background: #111827;
-          font-size: 11px;
-          color: #9ca3af;
-        }
-        .dot {
-          width: 6px;
-          height: 6px;
-          border-radius: 999px;
-          background: #22c55e;
-        }
-        .create-box {
-          border-radius: 16px;
-          border: 1px solid #1f2937;
-          background: #020617;
-          padding: 12px 14px;
-          display: flex;
-          flex-wrap: wrap;
-          gap: 8px;
-          align-items: center;
-          margin-bottom: 16px;
-        }
-        .create-box input {
-          background: #020617;
-          border-radius: 999px;
-          border: 1px solid #4b5563;
-          padding: 6px 10px;
-          color: #e5e7eb;
-          font-size: 13px;
-        }
-        .create-box input.small {
-          width: 80px;
-        }
-        .create-box input.notes {
-          flex: 1;
-          min-width: 180px;
-        }
-        .create-box button {
-          border-radius: 999px;
-          border: none;
-          padding: 6px 14px;
-          font-size: 13px;
-          cursor: pointer;
-          background: #3b82f6;
-          color: #e5e7eb;
-          font-weight: 600;
-        }
-        .create-status {
-          font-size: 12px;
-          color: #9ca3af;
-          width: 100%;
-        }
-        .create-status.error {
-          color: #f97373;
-        }
-        .table-wrapper {
-          border-radius: 16px;
-          border: 1px solid #1f2937;
-          overflow: hidden;
-          background: #020617;
-          max-height: 480px;
-          overflow-y: auto;
-        }
-        table {
-          width: 100%;
-          border-collapse: collapse;
-          margin-top: 8px;
-          font-size: 13px;
-        }
-        th, td {
-          padding: 8px 10px;
-          border-bottom: 1px solid #111827;
-        }
-        th {
-          text-align: left;
-          background: #020617;
-          position: sticky;
-          top: 0;
-          z-index: 1;
-        }
-        tbody tr:nth-child(even) {
-          background: rgba(15, 23, 42, 0.75);
-        }
-        .status-pill {
-          padding: 2px 8px;
-          border-radius: 999px;
-          font-size: 11px;
-          display: inline-block;
-        }
-        .status-active {
-          background: rgba(34, 197, 94, 0.12);
-          color: #4ade80;
-        }
-        .status-inactive {
-          background: rgba(239, 68, 68, 0.16);
-          color: #f87171;
-        }
-        .error-msg {
-          font-size: 12px;
-          color: #f97373;
-          margin-top: 4px;
-        }
-        .toolbar-right {
-          display: flex;
-          gap: 8px;
-          align-items: center;
-        }
-        .btn-small {
-          border-radius: 999px;
-          border: 1px solid #374151;
-          background: #111827;
-          color: #e5e7eb;
-          padding: 4px 10px;
-          font-size: 12px;
-          cursor: pointer;
-        }
-        .search-input {
-          background: #020617;
-          border-radius: 999px;
-          border: 1px solid #4b5563;
-          padding: 4px 10px;
-          font-size: 12px;
-          color: #e5e7eb;
-          min-width: 200px;
-        }
-      </style>
-    </head>
-    <body>
-      <header>
-        <h1>TriboTools &mdash; Painel de Licenças</h1>
-        <span class="badge">API v<span id="apiVersion">-</span></span>
-      </header>
-      <main>
-        <div class="token-box">
-          <label for="tokenInput">Admin Token (mesmo usado no Swagger):</label>
-          <input id="tokenInput" type="password" placeholder="ex.: tribotools_master_2025" />
-          <button id="saveTokenBtn">Salvar token</button>
-          <button id="loadBtn" class="secondary">Carregar dados</button>
-          <div class="token-status" id="tokenStatus"></div>
-        </div>
-
-        <div class="cards">
-          <div class="card">
-            <h3>Total de licenças</h3>
-            <div class="value" id="cardTotalLic">-</div>
-            <div class="sub">Registradas no banco</div>
-          </div>
-          <div class="card">
-            <h3>Ativações ativas</h3>
-            <div class="value" id="cardActiveAct">-</div>
-            <div class="sub">Tokens ainda válidos</div>
-          </div>
-          <div class="card">
-            <h3>Dispositivos únicos</h3>
-            <div class="value" id="cardDevices">-</div>
-            <div class="sub">Máquinas com licença ativa</div>
-          </div>
-          <div class="card">
-            <h3>Eventos últimas 24h</h3>
-            <div class="value" id="cardUsage24h">-</div>
-            <div class="sub">run / activate / validate</div>
-          </div>
-        </div>
-
-        <div class="section">
-          <div>
-            <div class="section-title">Criar nova licença</div>
-            <div class="section-sub">Gere chaves para clientes sem precisar do Swagger.</div>
-          </div>
-          <span class="pill"><span class="dot"></span> Requer ADMIN_TOKEN válido</span>
-        </div>
-
-        <div class="create-box">
-          <input id="newKey" placeholder="Chave (ex.: TT-CLIENTE-001)" />
-          <input id="newMax" class="small" type="number" min="1" value="1" />
-          <input id="newNotes" class="notes" placeholder="Notas (opcional)" />
-          <button id="createLicBtn">Criar licença</button>
-          <div id="createStatus" class="create-status"></div>
-        </div>
-
-        <div class="section">
-          <div class="section-title">Licenças & uso</div>
-          <div class="toolbar-right">
-            <input id="searchInput" class="search-input" placeholder="Buscar por hash ou notas..." />
-            <button id="exportCsvBtn" class="btn-small">Exportar CSV</button>
-            <span class="section-sub">
-              <span class="pill"><span class="dot"></span> Atualizado em <span id="lastUpdated">-</span></span>
-            </span>
-          </div>
-        </div>
-
-        <div id="usageError" class="error-msg"></div>
-
-        <div class="table-wrapper">
-          <table>
-            <thead>
-              <tr>
-                <th>Licença (hash)</th>
-                <th>Status</th>
-                <th>Máx. devices</th>
-                <th>Devices usados</th>
-                <th>Execuções (run)</th>
-                <th>Ativações</th>
-                <th>Validações</th>
-                <th>Eventos total</th>
-                <th>Notas</th>
-                <th>Ações</th>
-              </tr>
-            </thead>
-            <tbody id="usageBody">
-              <tr><td colspan="10">Nenhum dado ainda. Clique em "Carregar dados".</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </main>
-
-      <script>
-        const tokenInput = document.getElementById("tokenInput");
-        const saveTokenBtn = document.getElementById("saveTokenBtn");
-        const loadBtn = document.getElementById("loadBtn");
-        const tokenStatus = document.getElementById("tokenStatus");
-        const usageBody = document.getElementById("usageBody");
-        const usageError = document.getElementById("usageError");
-        const apiVersionSpan = document.getElementById("apiVersion");
-        const lastUpdatedSpan = document.getElementById("lastUpdated");
-
-        const cardTotalLic = document.getElementById("cardTotalLic");
-        const cardActiveAct = document.getElementById("cardActiveAct");
-        const cardDevices   = document.getElementById("cardDevices");
-        const cardUsage24h  = document.getElementById("cardUsage24h");
-
-        const newKey   = document.getElementById("newKey");
-        const newMax   = document.getElementById("newMax");
-        const newNotes = document.getElementById("newNotes");
-        const createBtn = document.getElementById("createLicBtn");
-        const createStatus = document.getElementById("createStatus");
-        const exportCsvBtn = document.getElementById("exportCsvBtn");
-        const searchInput = document.getElementById("searchInput");
-
-        let currentRows = [];
-
-        function getToken() {
-          return window.localStorage.getItem("tt_admin_token") || "";
-        }
-
-        function setToken(tok) {
-          if (tok) {
-            window.localStorage.setItem("tt_admin_token", tok);
-          } else {
-            window.localStorage.removeItem("tt_admin_token");
-          }
-        }
-
-        function updateTokenStatus() {
-          const t = getToken();
-          if (t) {
-            tokenStatus.textContent = "Token salvo localmente (localStorage).";
-          } else {
-            tokenStatus.textContent = "Nenhum token salvo. Cole o ADMIN_TOKEN e clique em Salvar.";
-          }
-        }
-
-        saveTokenBtn.addEventListener("click", () => {
-          const v = tokenInput.value.trim();
-          setToken(v);
-          updateTokenStatus();
-        });
-
-        loadBtn.addEventListener("click", async () => {
-          await carregarTudo();
-        });
-
-        tokenInput.value = getToken();
-        updateTokenStatus();
-
-        async function fetchJSON(url, opts = {}) {
-          const token = getToken();
-          const headers = Object.assign(
-            { "Accept": "application/json" },
-            opts.headers || {},
-          );
-          if (token) {
-            headers["Authorization"] = "Bearer " + token;
-          }
-          const fetchOptions = {
-            method: opts.method || "GET",
-            headers,
-          };
-          if (opts.body) {
-            fetchOptions.body = opts.body;
-          }
-          const resp = await fetch(url, fetchOptions);
-          if (!resp.ok) {
-            const txt = await resp.text();
-            throw new Error(resp.status + " " + txt);
-          }
-          return resp.json();
-        }
-
-        async function fetchCSV(url) {
-          const token = getToken();
-          const headers = {};
-          if (token) {
-            headers["Authorization"] = "Bearer " + token;
-          }
-          const resp = await fetch(url, {
-            method: "GET",
-            headers,
-          });
-          if (!resp.ok) {
-            const txt = await resp.text();
-            throw new Error(resp.status + " " + txt);
-          }
-          return await resp.blob();
-        }
-
-        async function carregarStats() {
-          try {
-            const s = await fetchJSON("/stats");
-            cardTotalLic.textContent = s.total_licenses ?? "-";
-            cardActiveAct.textContent = s.active_activations ?? "-";
-            cardDevices.textContent = s.unique_devices ?? "-";
-            cardUsage24h.textContent = s.usage_24h ?? "-";
-          } catch (e) {
-            console.error(e);
-          }
-        }
-
-        function renderUsageTable(rows) {
-          currentRows = rows || [];
-          usageBody.innerHTML = "";
-          if (!rows || !rows.length) {
-            const tr = document.createElement("tr");
-            const td = document.createElement("td");
-            td.colSpan = 10;
-            td.textContent = "Nenhuma licença encontrada.";
-            tr.appendChild(td);
-            usageBody.appendChild(tr);
-            return;
-          }
-          for (const r of rows) {
-            const tr = document.createElement("tr");
-
-            const tdKey = document.createElement("td");
-            tdKey.textContent = r.license_key_hash;
-            tr.appendChild(tdKey);
-
-            const tdStatus = document.createElement("td");
-            const span = document.createElement("span");
-            span.classList.add("status-pill");
-            if ((r.status || "").toLowerCase() === "active") {
-              span.classList.add("status-active");
-              span.textContent = "Ativa";
-            } else {
-              span.classList.add("status-inactive");
-              span.textContent = "Inativa";
-            }
-            tdStatus.appendChild(span);
-            tr.appendChild(tdStatus);
-
-            const tdMax = document.createElement("td");
-            tdMax.textContent = r.max_devices ?? "-";
-            tr.appendChild(tdMax);
-
-            const tdDev = document.createElement("td");
-            tdDev.textContent = r.devices ?? 0;
-            tr.appendChild(tdDev);
-
-            const tdRuns = document.createElement("td");
-            tdRuns.textContent = r.runs ?? 0;
-            tr.appendChild(tdRuns);
-
-            const tdAct = document.createElement("td");
-            tdAct.textContent = r.activations ?? 0;
-            tr.appendChild(tdAct);
-
-            const tdVal = document.createElement("td");
-            tdVal.textContent = r.validations ?? 0;
-            tr.appendChild(tdVal);
-
-            const tdTotal = document.createElement("td");
-            tdTotal.textContent = r.total_events ?? 0;
-            tr.appendChild(tdTotal);
-
-            const tdNotes = document.createElement("td");
-            tdNotes.textContent = r.notes || "";
-            tr.appendChild(tdNotes);
-
-            const tdActions = document.createElement("td");
-            const btnToggle = document.createElement("button");
-            btnToggle.textContent = (r.status || "").toLowerCase() === "active" ? "Desativar" : "Ativar";
-            btnToggle.className = "btn-small";
-            btnToggle.style.marginRight = "4px";
-            btnToggle.onclick = () => toggleLicense(r.license_key_hash, r.status);
-
-            const btnRevoke = document.createElement("button");
-            btnRevoke.textContent = "Derrubar";
-            btnRevoke.className = "btn-small";
-            btnRevoke.onclick = () => revokeLicense(r.license_key_hash);
-
-            tdActions.appendChild(btnToggle);
-            tdActions.appendChild(btnRevoke);
-            tr.appendChild(tdActions);
-
-            usageBody.appendChild(tr);
-          }
-        }
-
-        function applyFilter() {
-          const term = (searchInput.value || "").toLowerCase();
-          if (!term) {
-            renderUsageTable(currentRows);
-            return;
-          }
-          const filtered = currentRows.filter(r => {
-            const h = (r.license_key_hash || "").toLowerCase();
-            const n = (r.notes || "").toLowerCase();
-            return h.includes(term) || n.includes(term);
-          });
-          renderUsageTable(filtered);
-        }
-
-        searchInput.addEventListener("input", () => {
-          applyFilter();
-        });
-
-        async function carregarUsage() {
-          usageError.textContent = "";
-          try {
-            const data = await fetchJSON("/api/admin/usage-summary");
-            renderUsageTable(data.rows || []);
-          } catch (e) {
-            console.error(e);
-            usageError.textContent = "Erro ao carregar uso: " + e.message;
-          }
-        }
-
-        async function carregarVersao() {
-          try {
-            const d = await fetchJSON("/");
-            if (d && d.version) {
-              apiVersionSpan.textContent = d.version;
-            }
-          } catch (e) {}
-        }
-
-        async function carregarTudo() {
-          await Promise.all([
-            carregarVersao(),
-            carregarStats(),
-            carregarUsage(),
-          ]);
-          const now = new Date();
-          lastUpdatedSpan.textContent = now.toLocaleString("pt-BR");
-        }
-
-        createBtn.addEventListener("click", async () => {
-          createStatus.textContent = "";
-          createStatus.classList.remove("error");
-
-          const key = newKey.value.trim();
-          const max = parseInt(newMax.value || "1", 10);
-          const notes = newNotes.value.trim();
-
-          if (!key) {
-            createStatus.textContent = "Informe uma chave (ex.: TT-CLIENTE-001).";
-            createStatus.classList.add("error");
-            return;
-          }
-
-          try {
-            await fetchJSON("/api/admin/licenses", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                license_key: key,
-                max_devices: max || 1,
-                notes: notes,
-              }),
-            });
-            createStatus.textContent = "Licença criada com sucesso.";
-            newKey.value = "";
-            newNotes.value = "";
-            await carregarTudo();
-          } catch (e) {
-            console.error(e);
-            createStatus.textContent = "Erro ao criar licença: " + e.message;
-            createStatus.classList.add("error");
-          }
-        });
-
-        exportCsvBtn.addEventListener("click", async () => {
-          try {
-            const blob = await fetchCSV("/api/admin/usage-csv");
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = "tribotools_usage_summary.csv";
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          URL.revokeObjectURL(url);
-          } catch (e) {
-            console.error(e);
-            alert("Erro ao exportar CSV: " + e.message);
-          }
-        });
-
-        async function toggleLicense(licHash, status) {
-          const newStatus = (status || "").toLowerCase() === "active" ? "inactive" : "active";
-          try {
-            await fetchJSON("/api/admin/licenses/" + encodeURIComponent(licHash) + "/status", {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status: newStatus }),
-            });
-            await carregarTudo();
-          } catch (e) {
-            alert("Erro ao alterar status: " + e.message);
-          }
-        }
-
-        async function revokeLicense(licHash) {
-          if (!confirm("Tem certeza que deseja DERRUBAR todas as ativações dessa licença e marcá-la como inativa?")) {
-            return;
-          }
-          try {
-            await fetchJSON("/api/admin/licenses/" + encodeURIComponent(licHash) + "/revoke", {
-              method: "POST",
-            });
-            await carregarTudo();
-          } catch (e) {
-            alert("Erro ao derrubar licença: " + e.message);
-          }
-        }
-
-        // carrega stats básicos ao abrir (mesmo sem token)
-        carregarVersao();
-        carregarStats();
-      </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
-
 
 # ================== INCLUDE ROUTERS ==================
+app.include_router(core)
+app.include_router(admin, prefix="/api")
 
-app.include_router(core)                  # rotas públicas em "/"
-app.include_router(admin, prefix="/api")  # rotas admin em "/api/admin/..."
-
-
-# Exec local
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("tribotools_api:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-# ================= BOT SALES / MERCADO PAGO =================
-import os
-import uuid
-import requests
-from fastapi import Request
-
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL")
-
-
-import uuid
-import os
-import requests
-from fastapi import Request
-
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL")
-
-SERVICES = {
-    "robo_meet": {
-        "price": 97.00,
-        "credits": 1000,
-        "days": 30,
-        "max_devices": 1
-    }
-}
-
-@app.post("/bot/order/create")
-def create_order(data: dict):
-    if not MP_ACCESS_TOKEN or not BASE_PUBLIC_URL:
-        return {"error": "Missing env vars"}
-
-    service = data.get("service")
-    telegram_id = data.get("telegram_id")
-    payer_email = data.get("payer_email")
-
-    if not payer_email:
-        return {"error": "payer_email is required"}
-
-    if service not in SERVICES:
-        return {"error": "Serviço inválido"}
-
-    s = SERVICES[service]
-
-    payload = {
-        "transaction_amount": float(s["price"]),
-        "description": f"[BOTv2] Licença {service} - TriboTools",
-        "payment_method_id": "pix",
-        "payer": {
-            "email": payer_email
-        },
-        "notification_url": f"{BASE_PUBLIC_URL}/webhooks/mercadopago",
-        "external_reference": f"tg:{telegram_id}|svc:{service}"
-    }
-
-    idem_key = str(uuid.uuid4())
-
-    r = requests.post(
-        "https://api.mercadopago.com/v1/payments",
-        headers={
-            "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-            "X-Idempotency-Key": idem_key
-        },
-        json=payload,
-        timeout=30
-    )
-
-    resp = r.json()
-    resp["_debug_idem_key"] = idem_key
-    resp["_http_status"] = r.status_code
-    return resp
-
-
-
-@app.post("/webhooks/mercadopago")
-async def mercadopago_webhook(request: Request):
-    if not MP_ACCESS_TOKEN:
-        return {"status": "missing_mp_token"}
-
-    body = await request.json()
-    payment_id = (body.get("data") or {}).get("id")
-
-    if not payment_id:
-        return {"status": "ignored"}
-
-    r = requests.get(
-        f"https://api.mercadopago.com/v1/payments/{payment_id}",
-        headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"},
-        timeout=30,
-    )
-
-    payment = r.json()
-    status = payment.get("status")
-
-    if status != "approved":
-        return {"status": status, "payment_id": payment_id}
-
-    return {"status": "paid_confirmed", "payment_id": payment_id}
-
-import os, requests
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BASE_PUBLIC_URL = os.getenv("BASE_PUBLIC_URL")
-
-def tg_send(chat_id: int, text: str, reply_markup: dict | None = None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    r = requests.post(url, json=payload, timeout=20)
-    return r.json()
-
-@app.post("/webhooks/telegram")
-async def telegram_webhook(update: dict):
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "error": "missing TELEGRAM_BOT_TOKEN"}
-
-    msg = update.get("message") or update.get("edited_message")
-    if not msg:
-        return {"ok": True}
-
-    chat_id = msg["chat"]["id"]
-    text = (msg.get("text") or "").strip().lower()
-
-    if text in ("/start", "start"):
-        tg_send(chat_id, "Fala! 👋\nEscolha um produto:\n\n1) Robô Meet (R$97)\n\nDigite: <b>1</b>")
-        return {"ok": True}
-
-    if text == "1":
-        # chama seu próprio create_order
-        payload = {"service":"robo_meet","telegram_id": str(chat_id), "payer_email":"teste@exemplo.com"}
-        # ⚠️ ideal: pedir email pro usuário (faço já já)
-        r = requests.post(f"{BASE_PUBLIC_URL}/bot/order/create", json=payload, timeout=30)
-        data = r.json()
-
-        ticket = (data.get("point_of_interaction", {})
-                    .get("transaction_data", {})
-                    .get("ticket_url"))
-
-        qr = (data.get("point_of_interaction", {})
-                .get("transaction_data", {})
-                .get("qr_code"))
-
-        pay_id = data.get("id")
-
-        if ticket:
-            kb = {"inline_keyboard": [[{"text":"💳 Pagar agora", "url": ticket}]]}
-            tg_send(chat_id, f"✅ Pedido criado!\n\nID: <code>{pay_id}</code>\n\nClique pra pagar:", kb)
-            tg_send(chat_id, f"Pix copia e cola (opcional):\n<code>{qr}</code>" if qr else "QR indisponível.")
-        else:
-            tg_send(chat_id, f"⚠️ Não consegui gerar link de pagamento. Retorno:\n<code>{data}</code>")
-
-        return {"ok": True}
-
-    tg_send(chat_id, "Não entendi. Digite <b>1</b> para Robô Meet.")
-    return {"ok": True}
-
-
-
