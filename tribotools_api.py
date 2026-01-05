@@ -2,13 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-TriboTools API (Licenças) + Bot Telegram + Mercado Pago PIX
-+ /panel (HTML) para: criar chave, listar chaves, ver uso e contagem por licença.
-
-✅ IMPORTANTE (do jeito que você pediu):
-- NÃO é por créditos (mantive as tabelas/rotas de crédito por compatibilidade, mas o fluxo e o painel NÃO exibem nem usam créditos)
-- A licença fica válida por X dias A PARTIR DA ATIVAÇÃO (default 30 dias, configurável por produto)
-- /panel/create_license corrigido (erro sqlite3.Row .get)
+TriboTools API (Licenças + Créditos) + Bot Telegram + Mercado Pago PIX
 
 ENV VARS (Render):
 - LICENSE_DB
@@ -17,7 +11,12 @@ ENV VARS (Render):
 - MP_ACCESS_TOKEN
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_WEBHOOK_SECRET
-- PANEL_PASSWORD               (opcional; se setar, exige /panel?p=... e demais rotas do painel)
+
+Fluxo Telegram:
+- /start -> mostra menu
+- seleciona produto -> pede e-mail
+- envia e-mail -> cria PIX (MercadoPago) -> manda QR + copia/cola + link
+- webhook MercadoPago aprovado -> gera licença + créditos -> entrega no Telegram
 """
 
 from __future__ import annotations
@@ -30,17 +29,20 @@ import os
 import sqlite3
 import threading
 import uuid
+import io
+import csv
 import re
 import requests
-import hmac
 
-from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request, Form
+from fastapi import FastAPI, HTTPException, Depends, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
-API_VERSION = "TT-1.4.0"
+import hmac
+
+API_VERSION = "TT-1.2.0"
 
 # ================== ENV ==================
 BASE_DIR = Path(__file__).resolve().parent
@@ -55,26 +57,26 @@ MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
-PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "").strip()
-
-# ================== PRODUTOS / COPY ==================
-# (sem créditos)
+# ================== COPY / PRODUTOS ==================
+# Edite aqui a copy. Deixa em HTML porque vamos mandar com parse_mode=HTML.
 SALES = {
     "robo_meet": {
         "title": "Robô Audiência Google Meet",
         "price": 97.00,
         "currency": "BRL",
-        "days": 30,          # ✅ validade da licença a partir da ATIVAÇÃO
+        "credits": 1000,
+        "days": 30,
         "max_devices": 1,
         "short": (
             "<b>Robô Audiência Google Meet</b>\n"
             "• Abre múltiplos perfis e entra na sala automaticamente\n"
             "• Ideal pra prova social / eventos / lançamentos\n"
-            "• Licença por máquina • <b>30 dias após ativar</b>\n"
+            "• Licença por máquina + <b>1000 créditos</b>\n"
         )
     },
-    # Adicione mais produtos aqui:
-    # "robo_tiktok": {"title": "...", "price": 197.0, "days": 30, "max_devices": 1, "short": "..."}
+    # Você pode ir adicionando:
+    # "robo_tiktok": {...},
+    # "disparo_agenda": {...},
 }
 
 WELCOME_COPY = (
@@ -99,8 +101,8 @@ DELIVERY_COPY = (
     "🎉 <b>Pagamento aprovado!</b>\n\n"
     "Aqui está sua licença e instruções de ativação:\n\n"
     "<b>Chave:</b> <code>{license_key}</code>\n"
-    "<b>Validade:</b> {days} dias <b>a partir da ativação</b>\n"
-    "<b>Máquinas:</b> {max_devices}\n\n"
+    "<b>Validade:</b> {days} dias\n"
+    "<b>Créditos:</b> {credits}\n\n"
     "Se quiser trocar de máquina, me chama aqui que a gente resolve."
 )
 
@@ -124,12 +126,6 @@ def now_utc_str() -> str:
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]  # (cid, name, type, notnull, dflt_value, pk)
-    return col in cols
-
 def init_db():
     conn = connect_once()
     cur = conn.cursor()
@@ -144,10 +140,6 @@ def init_db():
             created_at TEXT
         )
     """)
-
-    # ✅ migração: license_days (validade após ativar)
-    if not table_has_column(conn, "license", "license_days"):
-        cur.execute("ALTER TABLE license ADD COLUMN license_days INTEGER DEFAULT 30")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS activation (
@@ -175,9 +167,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_license ON usage(license_key_hash)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_device ON usage(device_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_event ON usage(event)")
 
-    # Créditos (mantidos, mas não usados no fluxo/painel)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credit_wallet (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +177,7 @@ def init_db():
             updated_at TEXT
         )
     """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credit_tx (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +190,7 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_credit_tx_lic ON credit_tx(license_key_hash)")
 
-    # Telegram state
+    # Estado do Telegram (pra saber se o usuário tá “esperando email” etc.)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tg_state (
             telegram_id TEXT PRIMARY KEY,
@@ -209,7 +200,7 @@ def init_db():
         )
     """)
 
-    # Orders
+    # Pedidos
     cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,6 +216,19 @@ def init_db():
         )
     """)
 
+    conn.commit()
+
+def ensure_wallet_for_license(lic_hash: str) -> None:
+    conn = connect_once()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
+    if cur.fetchone():
+        return
+    now = now_utc_str()
+    cur.execute(
+        "INSERT INTO credit_wallet (license_key_hash, balance, created_at, updated_at) VALUES (?,?,?,?)",
+        (lic_hash, 0, now, now),
+    )
     conn.commit()
 
 # ================== ADMIN AUTH ==================
@@ -257,19 +261,6 @@ admin = APIRouter(prefix="/admin", tags=["admin"])
 def _startup():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     init_db()
-
-# ================== PANEL AUTH ==================
-def panel_auth(request: Request):
-    if PANEL_PASSWORD:
-        p = (request.query_params.get("p") or "").strip()
-        if not p or not hmac.compare_digest(p, PANEL_PASSWORD):
-            raise HTTPException(401, "Acesso negado. Use /panel?p=SENHA")
-
-def panel_qs(request: Request) -> str:
-    if not PANEL_PASSWORD:
-        return ""
-    p = (request.query_params.get("p") or "").strip()
-    return f"?p={p}" if p else ""
 
 # ================== TELEGRAM HELPERS ==================
 def tg_api(method: str) -> str:
@@ -362,6 +353,8 @@ def mp_create_pix(service: str, telegram_id: str, payer_email: str):
         timeout=30,
     )
     data = r.json()
+    data["_debug_idem_key"] = idem_key
+    data["_http_status"] = r.status_code
     if r.status_code >= 400:
         raise HTTPException(r.status_code, data)
     return data
@@ -375,24 +368,36 @@ def mp_get_payment(payment_id: str):
     return r.status_code, r.json()
 
 def generate_license_key(prefix="TT"):
+    # chave amigável pro cliente (não só hash)
     return f"{prefix}-{uuid.uuid4().hex[:6].upper()}-{uuid.uuid4().hex[:6].upper()}"
 
-def create_license_record(license_key: str, max_devices: int, license_days: int, notes: str = ""):
+def upsert_license_and_credits(license_key: str, max_devices: int, credits: int, notes: str = ""):
     lic_hash = sha256(license_key)
     conn = connect_once()
     cur = conn.cursor()
 
+    # cria licença se não existir
     cur.execute("SELECT id FROM license WHERE license_key_hash=?", (lic_hash,))
-    if cur.fetchone() is not None:
-        return lic_hash
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO license (license_key_hash, status, max_devices, notes, created_at) VALUES (?,?,?,?,?)",
+            (lic_hash, "active", int(max_devices or 1), notes, now_utc_str()),
+        )
+        conn.commit()
 
+    ensure_wallet_for_license(lic_hash)
+
+    # adiciona créditos
+    now = now_utc_str()
     cur.execute(
-        "INSERT INTO license (license_key_hash, status, max_devices, notes, created_at, license_days) "
-        "VALUES (?,?,?,?,?,?)",
-        (lic_hash, "active", int(max_devices or 1), notes, now_utc_str(), int(license_days or 30)),
+        "UPDATE credit_wallet SET balance = balance + ?, updated_at=? WHERE license_key_hash=?",
+        (int(credits or 0), now, lic_hash),
+    )
+    cur.execute(
+        "INSERT INTO credit_tx (license_key_hash, change, reason, meta, created_at) VALUES (?,?,?,?,?)",
+        (lic_hash, int(credits or 0), "purchase", json.dumps({"license_key": license_key}), now),
     )
     conn.commit()
-    return lic_hash
 
 # ================== ROTAS CORE ==================
 @core.get("/")
@@ -407,416 +412,15 @@ def healthz():
     tables = [r["name"] for r in cur.fetchall()]
     return {"ok": True, "tables": tables, "db_path": str(DB_PATH)}
 
-@core.get("/stats")
-def stats():
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM license")
-    total_licenses = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM activation WHERE datetime(expires_at) > datetime('now')")
-    active_activations = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(DISTINCT device_id) AS c FROM activation WHERE datetime(expires_at) > datetime('now')")
-    unique_devices = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM usage WHERE datetime(ts) > datetime('now','-1 day')")
-    usage_24h = cur.fetchone()["c"]
-    return {
-        "total_licenses": total_licenses,
-        "active_activations": active_activations,
-        "unique_devices": unique_devices,
-        "usage_24h": usage_24h,
-    }
-
-# ================== PANEL (HTML) ==================
-def _panel_layout(title: str, body_html: str) -> str:
-    return f"""
-    <html>
-    <head>
-      <meta charset="utf-8"/>
-      <meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <title>{title}</title>
-      <style>
-        body {{ font-family: Arial, sans-serif; padding: 24px; background:#0b0b0b; color:#ffd400; }}
-        a {{ color:#ffd400; text-decoration:none; }}
-        a:hover {{ text-decoration:underline; }}
-        .top {{ display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }}
-        .card {{ background:#111; border:1px solid #333; border-radius:14px; padding:16px; margin-bottom:16px; }}
-        .kpi {{ display:flex; gap:12px; flex-wrap:wrap; }}
-        .kpi .card {{ flex:1; min-width:220px; }}
-        table {{ width:100%; border-collapse: collapse; }}
-        th, td {{ border-bottom: 1px solid #222; padding: 10px; text-align:left; color:#eee; }}
-        th {{ color:#ffd400; }}
-        input, select {{ width:100%; padding:10px; border-radius:10px; border:1px solid #333; background:#0f0f0f; color:#fff; }}
-        button {{ padding:12px 14px; border-radius:12px; border:1px solid #333; background:#ffd400; color:#000; font-weight:700; cursor:pointer; }}
-        button:hover {{ filter:brightness(0.95); }}
-        code {{ color:#fff; }}
-        .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }}
-        .small {{ color:#bbb; font-size:12px; }}
-      </style>
-    </head>
-    <body>
-      {body_html}
-    </body>
-    </html>
-    """
-
-@core.get("/panel", response_class=HTMLResponse)
-async def panel_home(request: Request):
-    panel_auth(request)
-    qs = panel_qs(request)
-
-    conn = connect_once()
-    cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) AS c FROM license")
-    total_licenses = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM activation WHERE datetime(expires_at) > datetime('now')")
-    active_activations = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM usage WHERE datetime(ts) > datetime('now','-1 day')")
-    usage_24h = cur.fetchone()["c"]
-
-    products_opts = ""
-    for k, s in SALES.items():
-        products_opts += f"<option value='{k}'>{s['title']} ({k})</option>"
-
-    html = f"""
-    <div class="top">
-      <h1 style="margin:0">🧭 TriboTools • Panel</h1>
-      <div class="small">DB: <code>{DB_PATH}</code></div>
-    </div>
-
-    <div class="card">
-      <b>Navegação:</b>
-      <div style="margin-top:8px; display:flex; gap:12px; flex-wrap:wrap;">
-        <a href="/panel{qs}">Home</a>
-        <a href="/panel/licenses{qs}">Licenças</a>
-        <a href="/panel/usage{qs}">Uso (logs)</a>
-        <a href="/panel/usage_by_license{qs}">Uso por licença</a>
-        <a href="/docs">/docs</a>
-        <a href="/healthz">/healthz</a>
-      </div>
-    </div>
-
-    <div class="kpi">
-      <div class="card"><h3 style="margin:0 0 8px 0">Total licenças</h3><div style="font-size:30px">{total_licenses}</div></div>
-      <div class="card"><h3 style="margin:0 0 8px 0">Ativações válidas</h3><div style="font-size:30px">{active_activations}</div></div>
-      <div class="card"><h3 style="margin:0 0 8px 0">Eventos (24h)</h3><div style="font-size:30px">{usage_24h}</div></div>
-    </div>
-
-    <div class="card">
-      <h2 style="margin:0 0 12px 0">Criar chave (rápido)</h2>
-      <form method="post" action="/panel/create_license{qs}">
-        <div class="grid">
-          <div>
-            <label class="small">Produto</label>
-            <select name="service">{products_opts}</select>
-          </div>
-          <div>
-            <label class="small">Max devices (override opcional)</label>
-            <input name="max_devices" placeholder="vazio = usa do produto" />
-          </div>
-          <div>
-            <label class="small">Dias de validade (override opcional)</label>
-            <input name="license_days" placeholder="vazio = usa do produto" />
-          </div>
-          <div>
-            <label class="small">Prefixo da licença</label>
-            <input name="prefix" value="TT" />
-          </div>
-        </div>
-        <div style="margin-top:12px;">
-          <button type="submit">Gerar licença agora</button>
-        </div>
-        <div class="small" style="margin-top:10px;">
-          * Licença válida por X dias a partir da ativação.
-        </div>
-      </form>
-    </div>
-    """
-    return HTMLResponse(_panel_layout("TriboTools • Panel", html))
-
-@core.post("/panel/create_license", response_class=HTMLResponse)
-async def panel_create_license(
-    request: Request,
-    service: str = Form(...),
-    max_devices: str = Form(""),
-    license_days: str = Form(""),
-    prefix: str = Form("TT"),
-):
-    panel_auth(request)
-    qs = panel_qs(request)
-
-    if service not in SALES:
-        raise HTTPException(400, "Serviço inválido.")
-
-    s = SALES[service]
-    md = int(max_devices) if (max_devices or "").strip().isdigit() else int(s.get("max_devices", 1))
-    days = int(license_days) if (license_days or "").strip().isdigit() else int(s.get("days", 30))
-    px = (prefix or "TT").strip() or "TT"
-
-    license_key = generate_license_key(prefix=px)
-    lic_hash = create_license_record(
-        license_key=license_key,
-        max_devices=md,
-        license_days=days,
-        notes=f"Panel manual svc:{service}",
-    )
-
-    html = f"""
-    <div class="card">
-      <h2 style="margin:0 0 12px 0">✅ Licença criada</h2>
-      <div><b>Produto:</b> {s['title']} ({service})</div>
-      <div style="margin-top:10px;"><b>Chave:</b> <code style="font-size:16px">{license_key}</code></div>
-      <div style="margin-top:10px;"><b>Hash:</b> <code>{lic_hash}</code></div>
-      <div style="margin-top:10px;"><b>Max devices:</b> {md}</div>
-      <div style="margin-top:10px;"><b>Validade:</b> {days} dias <b>a partir da ativação</b></div>
-      <div style="margin-top:14px; display:flex; gap:12px; flex-wrap:wrap;">
-        <a href="/panel/licenses{qs}">Ver licenças</a>
-        <a href="/panel{qs}">Voltar</a>
-      </div>
-    </div>
-    """
-    return HTMLResponse(_panel_layout("Licença criada", html))
-
-@core.get("/panel/licenses", response_class=HTMLResponse)
-async def panel_licenses(request: Request, limit: int = 200):
-    panel_auth(request)
-    qs = panel_qs(request)
-
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT id, license_key_hash, status, max_devices, license_days, notes, created_at
-      FROM license
-      ORDER BY id DESC
-      LIMIT ?
-    """, (int(limit),))
-    rows = cur.fetchall()
-
-    trs = ""
-    for r in rows:
-        trs += f"""
-        <tr>
-          <td>{r['id']}</td>
-          <td style="font-family:monospace">{r['license_key_hash']}</td>
-          <td>{r['status']}</td>
-          <td>{r['max_devices']}</td>
-          <td>{r['license_days']}</td>
-          <td>{(r['notes'] or '')[:120]}</td>
-          <td>{r['created_at']}</td>
-        </tr>
-        """
-
-    html = f"""
-    <div class="card">
-      <b>Navegação:</b>
-      <div style="margin-top:8px; display:flex; gap:12px; flex-wrap:wrap;">
-        <a href="/panel{qs}">Home</a>
-        <a href="/panel/licenses{qs}">Licenças</a>
-        <a href="/panel/usage{qs}">Uso (logs)</a>
-        <a href="/panel/usage_by_license{qs}">Uso por licença</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2 style="margin:0 0 12px 0">Licenças (últimas {min(limit, 200)})</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>License Hash</th>
-            <th>Status</th>
-            <th>Max</th>
-            <th>Dias</th>
-            <th>Notes</th>
-            <th>Criada</th>
-          </tr>
-        </thead>
-        <tbody>
-          {trs or "<tr><td colspan='7'>Nenhuma licença ainda.</td></tr>"}
-        </tbody>
-      </table>
-    </div>
-    """
-    return HTMLResponse(_panel_layout("Licenças", html))
-
-@core.get("/panel/usage", response_class=HTMLResponse)
-async def panel_usage(
-    request: Request,
-    license_hash: str = "",
-    device_id: str = "",
-    event: str = "",
-    limit: int = 200,
-):
-    panel_auth(request)
-    qs = panel_qs(request)
-
-    lh = (license_hash or "").strip()
-    dv = (device_id or "").strip()
-    ev = (event or "").strip()
-
-    where = []
-    params = []
-
-    if lh:
-        where.append("license_key_hash = ?")
-        params.append(lh)
-    if dv:
-        where.append("device_id = ?")
-        params.append(dv)
-    if ev:
-        where.append("event LIKE ?")
-        params.append(f"%{ev}%")
-
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    params.append(int(limit))
-
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute(f"""
-      SELECT ts, license_key_hash, device_id, event, meta
-      FROM usage
-      {where_sql}
-      ORDER BY datetime(ts) DESC
-      LIMIT ?
-    """, tuple(params))
-    rows = cur.fetchall()
-
-    trs = ""
-    for r in rows:
-        meta = (r["meta"] or "")
-        if len(meta) > 160:
-            meta = meta[:160] + "..."
-        trs += f"""
-        <tr>
-          <td>{r['ts']}</td>
-          <td style="font-family:monospace">{r['license_key_hash']}</td>
-          <td style="font-family:monospace">{r['device_id']}</td>
-          <td>{r['event']}</td>
-          <td style="font-family:monospace">{meta}</td>
-        </tr>
-        """
-
-    html = f"""
-    <div class="card">
-      <b>Navegação:</b>
-      <div style="margin-top:8px; display:flex; gap:12px; flex-wrap:wrap;">
-        <a href="/panel{qs}">Home</a>
-        <a href="/panel/licenses{qs}">Licenças</a>
-        <a href="/panel/usage{qs}">Uso (logs)</a>
-        <a href="/panel/usage_by_license{qs}">Uso por licença</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2 style="margin:0 0 12px 0">Logs de uso</h2>
-      <form method="get" action="/panel/usage{qs}">
-        <div class="grid">
-          <div>
-            <label class="small">license_hash (exato)</label>
-            <input name="license_hash" value="{lh}"/>
-          </div>
-          <div>
-            <label class="small">device_id (exato)</label>
-            <input name="device_id" value="{dv}"/>
-          </div>
-          <div>
-            <label class="small">event (contém)</label>
-            <input name="event" value="{ev}"/>
-          </div>
-          <div>
-            <label class="small">limit</label>
-            <input name="limit" value="{int(limit)}"/>
-          </div>
-        </div>
-        <div style="margin-top:12px;">
-          <button type="submit">Filtrar</button>
-        </div>
-      </form>
-    </div>
-
-    <div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th>TS</th>
-            <th>License Hash</th>
-            <th>Device</th>
-            <th>Event</th>
-            <th>Meta</th>
-          </tr>
-        </thead>
-        <tbody>
-          {trs or "<tr><td colspan='5'>Sem eventos.</td></tr>"}
-        </tbody>
-      </table>
-    </div>
-    """
-    return HTMLResponse(_panel_layout("Uso (logs)", html))
-
-@core.get("/panel/usage_by_license", response_class=HTMLResponse)
-async def panel_usage_by_license(request: Request, limit: int = 300):
-    panel_auth(request)
-    qs = panel_qs(request)
-
-    conn = connect_once()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT license_key_hash, COUNT(*) AS c
-      FROM usage
-      WHERE license_key_hash NOT IN ('TELEGRAM')
-      GROUP BY license_key_hash
-      ORDER BY c DESC
-      LIMIT ?
-    """, (int(limit),))
-    rows = cur.fetchall()
-
-    trs = ""
-    for r in rows:
-        trs += f"""
-        <tr>
-          <td style="font-family:monospace">{r['license_key_hash']}</td>
-          <td>{r['c']}</td>
-          <td><a href="/panel/usage{qs}&license_hash={r['license_key_hash']}">ver logs</a></td>
-        </tr>
-        """
-
-    html = f"""
-    <div class="card">
-      <b>Navegação:</b>
-      <div style="margin-top:8px; display:flex; gap:12px; flex-wrap:wrap;">
-        <a href="/panel{qs}">Home</a>
-        <a href="/panel/licenses{qs}">Licenças</a>
-        <a href="/panel/usage{qs}">Uso (logs)</a>
-        <a href="/panel/usage_by_license{qs}">Uso por licença</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2 style="margin:0 0 12px 0">Uso por licença</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>License Hash</th>
-            <th>Eventos</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {trs or "<tr><td colspan='3'>Sem dados ainda.</td></tr>"}
-        </tbody>
-      </table>
-    </div>
-    """
-    return HTMLResponse(_panel_layout("Uso por licença", html))
-
-# ================== TELEGRAM WEBHOOK ==================
 @core.post("/webhooks/telegram")
 async def telegram_webhook(update: dict = Body(...), request: Request = None):
+    # valida secret do Telegram (você já setou no setWebhook)
     if TELEGRAM_WEBHOOK_SECRET:
         received = (request.headers.get("x-telegram-bot-api-secret-token") or "").strip()
         if not received or not hmac.compare_digest(received, TELEGRAM_WEBHOOK_SECRET):
             raise HTTPException(status_code=401, detail="Webhook secret inválido.")
 
+    # log mínimo
     conn = connect_once()
     cur = conn.cursor()
     cur.execute(
@@ -826,17 +430,20 @@ async def telegram_webhook(update: dict = Body(...), request: Request = None):
     )
     conn.commit()
 
+    # --- mensagem normal ---
     message = update.get("message") or update.get("edited_message")
     if message and message.get("chat"):
         chat_id = message["chat"]["id"]
         text = (message.get("text") or "").strip()
         telegram_id = str(chat_id)
 
+        # /start
         if text.startswith("/start"):
             clear_tg_state(telegram_id)
             tg_send(chat_id, WELCOME_COPY, reply_markup=tg_menu_keyboard())
             return {"ok": True}
 
+        # se está aguardando e-mail:
         st = get_tg_state(telegram_id)
         if st.get("state") == "awaiting_email":
             if not is_email(text):
@@ -849,9 +456,11 @@ async def telegram_webhook(update: dict = Body(...), request: Request = None):
                 tg_send(chat_id, "⚠️ Serviço inválido. Use /start e escolha de novo.")
                 return {"ok": True}
 
+            # cria PIX
             pay = mp_create_pix(service=service, telegram_id=telegram_id, payer_email=text)
             payment_id = str(pay.get("id"))
 
+            # salva pedido
             cur.execute(
                 "INSERT INTO orders (telegram_id, service, payer_email, mp_payment_id, mp_status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
                 (telegram_id, service, text, payment_id, pay.get("status") or "pending", now_utc_str(), now_utc_str()),
@@ -872,9 +481,11 @@ async def telegram_webhook(update: dict = Body(...), request: Request = None):
             clear_tg_state(telegram_id)
             return {"ok": True}
 
+        # fallback
         tg_send(chat_id, "Digite /start para ver os produtos.")
         return {"ok": True}
 
+    # --- callback (botões) ---
     cb = update.get("callback_query")
     if cb:
         cb_id = cb.get("id")
@@ -900,7 +511,7 @@ async def telegram_webhook(update: dict = Body(...), request: Request = None):
 
     return {"ok": True}
 
-# ================== LICENÇA ==================
+# ================== LICENÇA / CRÉDITOS (mantive seu core) ==================
 @core.post("/activate")
 def activate(data: dict = Body(...)):
     license_key = (data.get("license_key") or "").strip()
@@ -914,15 +525,13 @@ def activate(data: dict = Body(...)):
     conn = connect_once()
     cur = conn.cursor()
 
-    cur.execute("SELECT status, max_devices, license_days FROM license WHERE license_key_hash=?", (lic_hash,))
+    cur.execute("SELECT status, max_devices FROM license WHERE license_key_hash=?", (lic_hash,))
     row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Licença inválida.")
     if (row["status"] or "") != "active":
         raise HTTPException(403, "Licença inativa.")
-
-    max_devices = int(row["max_devices"] or 1)
-    lic_days = int(row["license_days"] or 30)
+    max_devices = row["max_devices"] or 1
 
     cur.execute("SELECT COUNT(*) AS c FROM activation WHERE license_key_hash=?", (lic_hash,))
     qtd = cur.fetchone()["c"]
@@ -934,7 +543,7 @@ def activate(data: dict = Body(...)):
 
     token = str(uuid.uuid4())
     now = now_utc_str()
-    expires_at = (datetime.utcnow() + timedelta(days=lic_days)).strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = (datetime.utcnow() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
     cur.execute("""
         INSERT OR REPLACE INTO activation
@@ -946,11 +555,11 @@ def activate(data: dict = Body(...)):
     cur.execute(
         "INSERT INTO usage (ts, license_key_hash, device_id, event, meta) VALUES (?,?,?,?,?)",
         (now, lic_hash, device_id, "activate",
-         json.dumps({"fingerprint": fingerprint, "license_days": lic_days}, ensure_ascii=False)),
+         json.dumps({"fingerprint": fingerprint}, ensure_ascii=False)),
     )
     conn.commit()
 
-    return {"status": "ok", "token": token, "expires_at": expires_at, "max_devices": max_devices, "license_days": lic_days}
+    return {"status": "ok", "token": token, "expires_at": expires_at, "max_devices": max_devices}
 
 @core.post("/validate")
 def validate(data: dict = Body(...)):
@@ -996,6 +605,70 @@ def validate(data: dict = Body(...)):
 
     return {"valid": valid, "reason": reason}
 
+@core.get("/credits/balance")
+def credits_balance(token: str = Query(...), device_id: str = Query(...)):
+    conn = connect_once()
+    cur = conn.cursor()
+
+    token = token.strip()
+    device_id = device_id.strip()
+
+    cur.execute("SELECT license_key_hash, expires_at FROM activation WHERE token=? AND device_id=?", (token, device_id))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Ativação não encontrada para este token/device_id.")
+
+    lic_hash = row["license_key_hash"]
+    ensure_wallet_for_license(lic_hash)
+
+    cur.execute("SELECT balance FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
+    row2 = cur.fetchone()
+    balance = row2["balance"] if row2 else 0
+    return {"license_key_hash": lic_hash, "balance": balance}
+
+@core.post("/credits/consume")
+def credits_consume(data: dict = Body(...)):
+    token = (data.get("token") or "").strip()
+    device_id = (data.get("device_id") or "").strip()
+    amount = int(data.get("amount", 0))
+    if not token or not device_id:
+        raise HTTPException(400, "token e device_id são obrigatórios.")
+    if amount <= 0:
+        raise HTTPException(400, "amount deve ser > 0")
+
+    reason = (data.get("reason") or "").strip() or "consume"
+    meta = json.dumps(data.get("meta", {}), ensure_ascii=False)
+
+    conn = connect_once()
+    cur = conn.cursor()
+
+    cur.execute("SELECT license_key_hash FROM activation WHERE token=? AND device_id=?", (token, device_id))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Ativação não encontrada para este token/device_id.")
+
+    lic_hash = row["license_key_hash"]
+    ensure_wallet_for_license(lic_hash)
+
+    cur.execute("SELECT balance FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
+    row2 = cur.fetchone()
+    balance = row2["balance"] if row2 else 0
+
+    if balance < amount:
+        raise HTTPException(402, f"Créditos insuficientes. Saldo atual: {balance}, necessário: {amount}")
+
+    now = now_utc_str()
+    cur.execute("UPDATE credit_wallet SET balance = balance - ?, updated_at=? WHERE license_key_hash=?",
+                (amount, now, lic_hash))
+    cur.execute("INSERT INTO credit_tx (license_key_hash, change, reason, meta, created_at) VALUES (?,?,?,?,?)",
+                (lic_hash, -amount, reason, meta, now))
+    conn.commit()
+
+    cur.execute("SELECT balance FROM credit_wallet WHERE license_key_hash=?", (lic_hash,))
+    new_balance = (cur.fetchone() or {}).get("balance", 0)
+
+    return {"status": "ok", "license_key_hash": lic_hash, "debited": amount, "balance": new_balance}
+
 # ================== MERCADO PAGO WEBHOOK ==================
 @core.post("/webhooks/mercadopago")
 async def mercadopago_webhook(request: Request):
@@ -1003,6 +676,8 @@ async def mercadopago_webhook(request: Request):
         return {"status": "missing_mp_token"}
 
     body = await request.json()
+
+    # MercadoPago costuma mandar { "data": {"id": ...} } (como você mostrou)
     payment_id = (body.get("data") or {}).get("id")
     if not payment_id:
         return {"status": "ignored"}
@@ -1014,6 +689,7 @@ async def mercadopago_webhook(request: Request):
     status = payment.get("status") or ""
     ext_ref = payment.get("external_reference") or ""
 
+    # atualiza pedido
     conn = connect_once()
     cur = conn.cursor()
     cur.execute(
@@ -1025,6 +701,8 @@ async def mercadopago_webhook(request: Request):
     if status != "approved":
         return {"status": status, "payment_id": payment_id}
 
+    # extrai tg e svc
+    # ext_ref = "tg:123|svc:robo_meet"
     tg_id = ""
     svc = ""
     try:
@@ -1046,12 +724,13 @@ async def mercadopago_webhook(request: Request):
     if row and row["license_key"]:
         return {"status": "already_delivered", "payment_id": payment_id}
 
+    # gera licença e aplica créditos
     s = SALES[svc]
     license_key = generate_license_key(prefix="TT")
-    create_license_record(
+    upsert_license_and_credits(
         license_key=license_key,
         max_devices=s.get("max_devices", 1),
-        license_days=s.get("days", 30),
+        credits=s.get("credits", 0),
         notes=f"Order MP:{payment_id} tg:{tg_id} svc:{svc}",
     )
 
@@ -1061,29 +740,56 @@ async def mercadopago_webhook(request: Request):
     )
     conn.commit()
 
+    # entrega no telegram
     tg_send(
         tg_id,
-        DELIVERY_COPY.format(
-            license_key=license_key,
-            days=s.get("days", 30),
-            max_devices=s.get("max_devices", 1),
-        ),
+        DELIVERY_COPY.format(license_key=license_key, days=s.get("days", 30), credits=s.get("credits", 0)),
     )
 
     return {"status": "paid_confirmed", "payment_id": payment_id, "delivered": True}
 
 # ================== ADMIN (mínimo) ==================
 @admin.post("/licenses", dependencies=[Depends(require_admin)])
-def admin_create_license(body: dict = Body(...)):
+def create_license(body: dict = Body(...)):
     lk = (body.get("license_key") or "").strip()
     if not lk:
         raise HTTPException(400, "license_key obrigatório")
     max_dev = int(body.get("max_devices", 1) or 1)
-    days = int(body.get("license_days", 30) or 30)
     notes = body.get("notes", "")
+    lic_hash = sha256(lk)
 
-    create_license_record(lk, max_dev, days, notes=notes)
-    return {"status": "ok", "license_key_hash": sha256(lk), "max_devices": max_dev, "license_days": days}
+    conn = connect_once()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO license (license_key_hash, status, max_devices, notes, created_at) VALUES (?,?,?,?,?)",
+            (lic_hash, "active", max_dev, notes, now_utc_str()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Licença já existe")
+
+    ensure_wallet_for_license(lic_hash)
+    return {"status": "ok", "license_key_hash": lic_hash, "max_devices": max_dev}
+
+@core.get("/stats")
+def stats():
+    conn = connect_once()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS c FROM license")
+    total_licenses = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM activation WHERE datetime(expires_at) > datetime('now')")
+    active_activations = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(DISTINCT device_id) AS c FROM activation WHERE datetime(expires_at) > datetime('now')")
+    unique_devices = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM usage WHERE datetime(ts) > datetime('now','-1 day')")
+    usage_24h = cur.fetchone()["c"]
+    return {
+        "total_licenses": total_licenses,
+        "active_activations": active_activations,
+        "unique_devices": unique_devices,
+        "usage_24h": usage_24h,
+    }
 
 # ================== INCLUDE ROUTERS ==================
 app.include_router(core)
